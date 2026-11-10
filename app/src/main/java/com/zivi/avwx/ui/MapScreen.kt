@@ -402,7 +402,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
         // ---- timeline
         Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(12.dp)) {
             Text(
-                "Map © OpenStreetMap contributors · Satellite © EUMETSAT",
+                "Map © OpenStreetMap contributors, CARTO · Satellite © EUMETSAT",
                 fontSize = 9.sp, color = Color(0xFF1B2530),
                 modifier = Modifier.align(Alignment.End).padding(bottom = 4.dp, end = 4.dp),
             )

@@ -368,12 +368,22 @@ object Tiles {
     suspend fun load(ctx: Context, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
         val f = File(dir(ctx), "${z}_${x}_$y.png")
         try {
-            val bytes = if (f.exists() && f.length() > 100) f.readBytes()
-            else Net.getBytes("https://tile.openstreetmap.org/$z/$x/$y.png", maxBytes = 1_000_000)
             val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return@withContext null
-            if (!f.exists()) f.writeBytes(bytes)
-            bmp
+            if (f.exists() && f.length() > 100) {
+                val saved = BitmapFactory.decodeFile(f.absolutePath, opts)
+                if (saved != null) return@withContext saved
+            }
+            // Two map servers: if the first refuses or is down, the second is tried.
+            for (url in listOf(
+                "https://tile.openstreetmap.org/$z/$x/$y.png",
+                "https://a.basemaps.cartocdn.com/rastertiles/voyager/$z/$x/$y.png",
+            )) {
+                val bytes = try { Net.getBytes(url, maxBytes = 1_000_000, timeoutMs = 12_000) } catch (e: Exception) { continue }
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: continue
+                f.writeBytes(bytes)
+                return@withContext bmp
+            }
+            null
         } catch (e: Exception) {
             null
         }
