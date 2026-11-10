@@ -245,7 +245,7 @@ private fun StationCard(vm: AppViewModel, role: String, icao: String, at: Instan
             }
 
             // ---- upper air at this time
-            if (al != null) {
+            if (al != null && al.times.isNotEmpty()) {
                 val i = al.indexAt(at.epochSecond)
                 val near = kotlin.math.abs(al.times[i].epochSecond - at.epochSecond) <= 5400
                 if (near) {
