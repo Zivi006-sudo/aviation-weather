@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_bg">#0E2A3D</color>
+    <color name="app_bg">#0A0E13</color>
+    <color name="bar_bg">#10161D</color>
+    <style name="Theme.AvWx" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/app_bg</item>
+        <item name="android:statusBarColor">@color/app_bg</item>
+        <item name="android:navigationBarColor">@color/bar_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
