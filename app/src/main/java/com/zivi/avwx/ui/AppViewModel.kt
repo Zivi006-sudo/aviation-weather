@@ -12,6 +12,15 @@ import android.graphics.Bitmap
 import com.zivi.avwx.data.ExtraApi
 import com.zivi.avwx.data.Overlay
 import com.zivi.avwx.data.WxGrid
+import com.zivi.avwx.data.WxMerge
+import com.zivi.avwx.data.MvMet
+import com.zivi.avwx.data.Aircraft
+import com.zivi.avwx.data.Tiles
+import com.zivi.avwx.wx.pickReports
+import com.zivi.avwx.wx.GeoBounds
+import com.zivi.avwx.wx.Merc
+import com.zivi.avwx.wx.snapBox
+import kotlinx.coroutines.delay
 import com.zivi.avwx.data.Sat
 import com.zivi.avwx.data.SatFrame
 import com.zivi.avwx.data.SatRequest
@@ -41,6 +50,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         WxWorker.schedule(app)
+        viewModelScope.launch { runCatching { Tiles.trim(app) } }
     }
 
     // ------------------------------------------------------------ airports + weather
@@ -89,19 +99,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return ids.toList()
     }
 
+    /** Merges fresh reports into what is held, keeping the newer report for each station, and saves the result. */
+    private fun applyWx(fresh: Map<String, StationWx>) {
+        val merged = HashMap(rawWx)
+        for ((k, v) in fresh) merged[k] = WxMerge.pick(merged[k], v)
+        rawWx = merged
+        store.saveWx(merged)
+        decoded = decode(merged)
+        lastRefresh = System.currentTimeMillis()
+        runCatching { WxWidget.updateAll(getApplication()) }
+    }
+
     fun refresh() {
         val ids = wantedStations()
         if (refreshing || ids.isEmpty()) return
         refreshing = true
         viewModelScope.launch {
+            var failed = false
             try {
                 val res = WxApi.fetch(ids)
-                val merged = HashMap(rawWx)
-                merged.putAll(res.wx)
-                rawWx = merged
-                store.saveWx(merged)
-                decoded = decode(merged)
-                lastRefresh = System.currentTimeMillis()
+                applyWx(res.wx)
                 wxError = null
                 val pos = HashMap(positions)
                 for ((id, info) in res.info) {
@@ -126,11 +143,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     airports = updated
                     store.saveAirports(updated)
                 }
-                runCatching { WxWidget.updateAll(getApplication()) }
             } catch (e: Exception) {
+                failed = true
                 wxError = "Couldn't update. Showing saved weather."
             } finally {
                 refreshing = false
+            }
+            // Second source: the Maldives Met page, which carries airports the international feed misses.
+            try {
+                delay(1200)
+                val lines = MvMet.reports(getApplication())
+                if (lines.isNotEmpty()) {
+                    val picked = pickReports(lines, Instant.now())
+                    val at = System.currentTimeMillis()
+                    val fresh = HashMap<String, StationWx>()
+                    for (id in ids) {
+                        val r = picked[id] ?: continue
+                        fresh[id] = StationWx(id, r.first, r.second, at)
+                    }
+                    if (fresh.isNotEmpty()) {
+                        applyWx(fresh)
+                        if (failed) wxError = null
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // The first source's reports stay as they are.
             }
         }
     }
@@ -325,6 +364,42 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun previewSensitivity(v: Float) { sensitivity = v }
     fun commitSensitivity() { store.sensitivity = sensitivity; if (enhanced) reloadSat() }
 
+    /**
+     * Makes sure the satellite loop covers a map view (centre and scale in Mercator world units, size in pixels).
+     * Does nothing when the images already loaded cover it at a reasonable sharpness.
+     */
+    fun requestSatForView(cx: Double, cy: Double, scale: Double, wPx: Int, hPx: Int) {
+        if (scale <= 0.0 || wPx <= 0 || hPx <= 0) return
+        val vw = wPx / scale
+        val vh = hPx / scale
+        val view = GeoBounds(
+            west = Merc.lon((cx - vw / 2).coerceIn(0.0, 1.0)),
+            south = Merc.lat((cy + vh / 2).coerceIn(0.03, 0.97)),
+            east = Merc.lon((cx + vw / 2).coerceIn(0.0, 1.0)),
+            north = Merc.lat((cy - vh / 2).coerceIn(0.03, 0.97)),
+        )
+        val have = satRequest?.bounds
+        if (have != null && have.contains(view) && have.widthDeg <= view.widthDeg * 4.6) return
+        // A generous, grid-snapped area: panning nearby stays inside it, and coming back asks for the same box.
+        val b = snapBox(cx, cy, vw, vh, 2.0)
+        val want = GeoBounds(
+            west = Merc.lon(b[0].coerceIn(0.0, 1.0)),
+            south = Merc.lat(b[3].coerceIn(0.03, 0.97)),
+            east = Merc.lon(b[2].coerceIn(0.0, 1.0)),
+            north = Merc.lat(b[1].coerceIn(0.03, 0.97)),
+        )
+        val w: Int
+        val h: Int
+        if (hPx >= wPx) {
+            h = Sat.MAX_DIM
+            w = (Sat.MAX_DIM.toFloat() * wPx / hPx).toInt().coerceAtLeast(64)
+        } else {
+            w = Sat.MAX_DIM
+            h = (Sat.MAX_DIM.toFloat() * hPx / wPx).toInt().coerceAtLeast(64)
+        }
+        loadSat(SatRequest(want, w, h))
+    }
+
     fun reloadSat() {
         val req = satRequest ?: return
         loadSat(req)
@@ -451,6 +526,49 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 gridError = "Couldn't load the forecast layer."
             } finally {
                 if (gridJob === coroutineContext[Job]) gridLoading = false
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ live traffic
+
+    var aircraft by mutableStateOf<List<Aircraft>>(emptyList())
+        private set
+    var radarAt by mutableStateOf(0L)
+        private set
+    var radarError by mutableStateOf<String?>(null)
+        private set
+    /** Recent positions of each aircraft ([lat, lon]), oldest first. Read while drawing. */
+    val trails = HashMap<String, ArrayList<DoubleArray>>()
+    private var radarBusy = false
+
+    fun refreshRadar(lat: Double, lon: Double, radiusNm: Int) {
+        if (radarBusy) return
+        radarBusy = true
+        viewModelScope.launch {
+            try {
+                val list = ExtraApi.aircraft(lat, lon, radiusNm)
+                for (a in list) {
+                    val t = trails.getOrPut(a.hex) { ArrayList() }
+                    val last = t.lastOrNull()
+                    if (last == null || last[0] != a.lat || last[1] != a.lon) {
+                        t += doubleArrayOf(a.lat, a.lon)
+                        if (t.size > 80) t.removeAt(0)
+                    }
+                }
+                if (trails.size > 500) {
+                    val live = list.map { it.hex }.toSet()
+                    trails.keys.retainAll(live)
+                }
+                aircraft = list
+                radarAt = System.currentTimeMillis()
+                radarError = null
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                radarError = "Couldn't update traffic. Check your connection."
+            } finally {
+                radarBusy = false
             }
         }
     }

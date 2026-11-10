@@ -119,7 +119,8 @@ fun SectorScreen(vm: AppViewModel, now: Long) {
             if (vm.sectorDep.length == 4) StationCard(vm, "Departure", vm.sectorDep, etd ?: nowInst, null, nowInst)
             if (vm.sectorDest.length == 4) StationCard(vm, "Destination", vm.sectorDest, eta ?: nowInst, vm.destMinima, nowInst)
             if (vm.sectorAltn.length == 4) StationCard(vm, "Alternate", vm.sectorAltn, eta ?: nowInst, vm.altnMinima, nowInst)
-            if (listOf(vm.sectorDep, vm.sectorDest, vm.sectorAltn).any { it.startsWith("VR") }) NotamSection()
+            val sectorIcaos = listOf(vm.sectorDep, vm.sectorDest, vm.sectorAltn).filter { it.length == 4 }.distinct()
+            if (sectorIcaos.isNotEmpty()) NotamSection(sectorIcaos)
             Spacer(Modifier.height(16.dp))
         }
     }

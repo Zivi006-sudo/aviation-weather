@@ -15,6 +15,8 @@ import com.zivi.avwx.wx.GeoBounds
 import com.zivi.avwx.wx.Merc
 import com.zivi.avwx.wx.Minima
 import com.zivi.avwx.wx.Upper
+import com.zivi.avwx.wx.parseMetar
+import com.zivi.avwx.wx.parseTaf
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneOffset
@@ -37,11 +39,12 @@ data class StationWx(
 )
 
 object Defaults {
-    /** The five Maldivian airports with a met office. Runway idents are editable in the app. */
+    /** The Maldivian airports with a met office. Runway idents are editable in the app. */
     val airports = listOf(
         Airport("VRMM", "Velana Intl (Malé)", 4.1918, 73.5291, "18/36"),
         Airport("VRMG", "Gan Intl", -0.6933, 73.1556, "10/28"),
         Airport("VRMH", "Hanimaadhoo Intl", 6.7442, 73.1705, "03/21"),
+        Airport("VRDA", "Maafaru Intl", 5.8183, 73.4703, "18/36"),
         Airport("VRMK", "Kadhdhoo", 1.8592, 73.5219, "03/21"),
         Airport("VRMT", "Kaadedhdhoo", 0.4881, 72.9969, "15/33"),
     )
@@ -88,7 +91,21 @@ object Net {
 class Store(ctx: Context) {
     private val prefs = ctx.applicationContext.getSharedPreferences("avwx", Context.MODE_PRIVATE)
 
+    /** The saved list. Maafaru (VRDA) is added once to lists saved before it became a default. */
     fun loadAirports(): List<Airport> {
+        val list = loadSavedAirports()
+        if (!prefs.getBoolean("vrdaAdded", false)) {
+            prefs.edit().putBoolean("vrdaAdded", true).apply()
+            if (list.none { it.icao == "VRDA" }) {
+                val out = list + Defaults.airports.first { it.icao == "VRDA" }
+                saveAirports(out)
+                return out
+            }
+        }
+        return list
+    }
+
+    private fun loadSavedAirports(): List<Airport> {
         val s = prefs.getString("airports", null) ?: return Defaults.airports
         return try {
             val arr = JSONArray(s)
@@ -273,6 +290,44 @@ object WxApi {
     }
 }
 
+/** Combines reports for one station from two fetches or two sources, keeping whichever report is newer. */
+object WxMerge {
+    fun pick(old: StationWx?, new: StationWx): StationWx {
+        if (old == null) return new
+        val metar = newer(old.metarRaw, old.fetchedAt, new.metarRaw, new.fetchedAt) { raw, ref -> parseMetar(raw, ref)?.obsTime }
+        val taf = newer(old.tafRaw, old.fetchedAt, new.tafRaw, new.fetchedAt) { raw, ref -> parseTaf(raw, ref)?.issued }
+        return StationWx(new.icao, metar, taf, maxOf(old.fetchedAt, new.fetchedAt))
+    }
+
+    private fun newer(a: String?, aAt: Long, b: String?, bAt: Long, time: (String, Instant) -> Instant?): String? {
+        if (b == null) return a
+        if (a == null || a == b) return b
+        val ta = runCatching { time(a, Instant.ofEpochMilli(aAt)) }.getOrNull()
+        val tb = runCatching { time(b, Instant.ofEpochMilli(bAt)) }.getOrNull()
+        return if (ta != null && tb != null && ta.isAfter(tb)) a else b
+    }
+}
+
+// ---------------------------------------------------------------- live traffic
+
+class Aircraft(
+    val hex: String,
+    val flight: String,
+    val reg: String,
+    val type: String,
+    val lat: Double,
+    val lon: Double,
+    val altFt: Int?,
+    val onGround: Boolean,
+    val speedKt: Double?,
+    val track: Double?,
+    val vsFpm: Int?,
+    val squawk: String,
+    val seenSec: Double,
+) {
+    val label: String get() = flight.ifEmpty { reg.ifEmpty { hex.uppercase() } }
+}
+
 // ---------------------------------------------------------------- METAR history, SIGMET, winds aloft
 
 class Sigmet(
@@ -424,6 +479,53 @@ object ExtraApi {
         out
     }
 
+    /** Aircraft within [radiusNm] of a point, from community ADS-B receivers. Tries a second network if the first fails. */
+    suspend fun aircraft(lat: Double, lon: Double, radiusNm: Int): List<Aircraft> = withContext(Dispatchers.IO) {
+        val us = java.util.Locale.US
+        val la = "%.3f".format(us, lat)
+        val lo = "%.3f".format(us, lon)
+        val urls = listOf(
+            "https://api.airplanes.live/v2/point/$la/$lo/$radiusNm",
+            "https://api.adsb.lol/v2/lat/$la/lon/$lo/dist/$radiusNm",
+        )
+        var failure: Exception? = null
+        for (url in urls) {
+            try {
+                val arr = JSONObject(Net.getText(url, maxBytes = 3_000_000)).optJSONArray("ac") ?: JSONArray()
+                val out = ArrayList<Aircraft>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val pLat = o.optDouble("lat", Double.NaN)
+                    val pLon = o.optDouble("lon", Double.NaN)
+                    if (pLat.isNaN() || pLon.isNaN()) continue
+                    val alt = o.opt("alt_baro")
+                    val ground = alt is String
+                    val track = o.optDouble("track", o.optDouble("true_heading", Double.NaN))
+                    val gs = o.optDouble("gs", Double.NaN)
+                    out += Aircraft(
+                        hex = o.optString("hex", ""),
+                        flight = o.optString("flight", "").trim(),
+                        reg = o.optString("r", "").trim(),
+                        type = o.optString("t", "").trim(),
+                        lat = pLat,
+                        lon = pLon,
+                        altFt = if (alt is Number) alt.toInt() else null,
+                        onGround = ground,
+                        speedKt = if (gs.isNaN()) null else gs,
+                        track = if (track.isNaN()) null else track,
+                        vsFpm = if (o.has("baro_rate")) o.optInt("baro_rate") else if (o.has("geom_rate")) o.optInt("geom_rate") else null,
+                        squawk = o.optString("squawk", ""),
+                        seenSec = o.optDouble("seen_pos", o.optDouble("seen", 0.0)),
+                    )
+                }
+                return@withContext out
+            } catch (e: Exception) {
+                failure = e
+            }
+        }
+        throw failure ?: java.io.IOException("no traffic source")
+    }
+
     private fun parseTimes(h: JSONObject): List<Instant> {
         val tArr = h.getJSONArray("time")
         return (0 until tArr.length()).map { LocalDateTime.parse(tArr.getString(it)).toInstant(ZoneOffset.UTC) }
@@ -502,23 +604,35 @@ object ExtraApi {
 
 // ---------------------------------------------------------------- base map tiles
 
+enum class TileSource(val key: String, val maxZoom: Int, val parallel: Int) {
+    MAP("osm", 12, 2),      // OpenStreetMap asks for at most two downloads at a time
+    SAT("sat", 13, 4),
+}
+
 object Tiles {
     private fun dir(ctx: Context): File = File(ctx.filesDir, "tiles").apply { mkdirs() }
 
-    /** One 256 px map tile, from the phone if it was downloaded before. */
-    suspend fun load(ctx: Context, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
-        val f = File(dir(ctx), "${z}_${x}_$y.png")
+    private fun urls(s: TileSource, z: Int, x: Int, y: Int): List<String> = when (s) {
+        TileSource.MAP -> listOf(
+            "https://tile.openstreetmap.org/$z/$x/$y.png",
+            "https://a.basemaps.cartocdn.com/rastertiles/voyager/$z/$x/$y.png",
+        )
+        TileSource.SAT -> listOf(
+            "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/$z/$y/$x.jpg",
+            "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/$z/$y/$x.jpg",
+        )
+    }
+
+    /** One 256 px tile, from the phone if it was downloaded before. A second server is tried if the first fails. */
+    suspend fun load(ctx: Context, s: TileSource, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
+        val f = File(dir(ctx), "${s.key}_${z}_${x}_$y")
         try {
             val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
             if (f.exists() && f.length() > 100) {
                 val saved = BitmapFactory.decodeFile(f.absolutePath, opts)
                 if (saved != null) return@withContext saved
             }
-            // Two map servers: if the first refuses or is down, the second is tried.
-            for (url in listOf(
-                "https://tile.openstreetmap.org/$z/$x/$y.png",
-                "https://a.basemaps.cartocdn.com/rastertiles/voyager/$z/$x/$y.png",
-            )) {
+            for (url in urls(s, z, x, y)) {
                 val bytes = try { Net.getBytes(url, maxBytes = 1_000_000, timeoutMs = 12_000) } catch (e: Exception) { continue }
                 val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: continue
                 f.writeBytes(bytes)
@@ -527,6 +641,14 @@ object Tiles {
             null
         } catch (e: Exception) {
             null
+        }
+    }
+
+    /** Keeps the saved tiles to a few thousand files, dropping the ones used longest ago. */
+    suspend fun trim(ctx: Context) = withContext(Dispatchers.IO) {
+        val files = dir(ctx).listFiles() ?: return@withContext
+        if (files.size > 4000) {
+            files.sortedBy { it.lastModified() }.take(files.size - 3200).forEach { it.delete() }
         }
     }
 }

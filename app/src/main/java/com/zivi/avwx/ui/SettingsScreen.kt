@@ -97,10 +97,14 @@ fun SettingsScreen(vm: AppViewModel) {
 
             Section("Data sources") {
                 Text(
-                    "METAR, TAF and SIGMET: Aviation Weather Center (aviationweather.gov).\n" +
+                    "METAR and TAF: Aviation Weather Center (aviationweather.gov) and the Maldives Meteorological Service " +
+                        "aviation page; the newer report for each airport is shown.\n" +
+                        "SIGMET: Aviation Weather Center.\n" +
                         "Satellite, rain rate and cloud top height: EUMETSAT Meteosat, Indian Ocean coverage, every 15 minutes.\n" +
                         "Upper winds, freezing level, icing, turbulence and thunderstorm risk: Open-Meteo model forecast.\n" +
-                        "NOTAMs: link to the Maldives Airports Company page.\n" +
+                        "Live traffic: airplanes.live and adsb.lol community receivers. Aircraft outside their coverage are not shown.\n" +
+                        "Radar imagery: Sentinel-2 cloudless by EOX IT Services GmbH (contains modified Copernicus Sentinel data 2024).\n" +
+                        "NOTAMs: link to the airport's page on Windy.\n" +
                         "Map: © OpenStreetMap contributors.",
                     fontSize = 14.sp, lineHeight = 20.sp, color = MaterialTheme.colorScheme.onSurface,
                 )

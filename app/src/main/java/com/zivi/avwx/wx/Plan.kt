@@ -99,6 +99,41 @@ fun parseUtcTime(text: String, now: Instant): Instant? {
     return t
 }
 
+// ---------------------------------------------------------------- reports read from a web page
+
+private val BARE_TAF = Regex("^[A-Z]{4} \\d{6}Z \\d{4}/\\d{4}\\b.*")
+private val SPACES = Regex("\\s+")
+
+/**
+ * From report texts found on a page (any order, possibly several per station), the newest METAR and
+ * the newest TAF for each station. Returns station -> (METAR or null, TAF or null).
+ */
+fun pickReports(lines: List<String>, ref: Instant): Map<String, Pair<String?, String?>> {
+    val metars = HashMap<String, Pair<Instant, String>>()
+    val tafs = HashMap<String, Pair<Instant, String>>()
+    for (line in lines) {
+        var raw = line.replace("=", " ").replace(SPACES, " ").trim()
+        if (raw.length < 12) continue
+        if (BARE_TAF.matches(raw)) raw = "TAF $raw"
+        if (raw.startsWith("TAF")) {
+            val t = runCatching { parseTaf(raw, ref) }.getOrNull() ?: continue
+            val time = t.issued ?: t.validFrom ?: continue
+            if (t.groups.isEmpty()) continue
+            val have = tafs[t.station]
+            if (have == null || time.isAfter(have.first)) tafs[t.station] = time to raw
+        } else {
+            val m = runCatching { parseMetar(raw, ref) }.getOrNull() ?: continue
+            val time = m.obsTime ?: continue
+            if (m.station.length != 4) continue
+            val have = metars[m.station]
+            if (have == null || time.isAfter(have.first)) metars[m.station] = time to raw
+        }
+    }
+    val out = HashMap<String, Pair<String?, String?>>()
+    for (id in metars.keys + tafs.keys) out[id] = metars[id]?.second to tafs[id]?.second
+    return out
+}
+
 // ---------------------------------------------------------------- alerts
 
 /** Things worth a notification when a station's reports change. */

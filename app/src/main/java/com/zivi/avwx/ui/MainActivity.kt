@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
@@ -96,12 +97,18 @@ fun AppRoot(vm: AppViewModel) {
                 NavigationBarItem(
                     selected = tab == 2,
                     onClick = { tab = 2 },
-                    icon = { Icon(Icons.Filled.Send, contentDescription = null) },
-                    label = { Text("Sector") },
+                    icon = { Icon(Icons.Filled.LocationOn, contentDescription = null) },
+                    label = { Text("Radar") },
                 )
                 NavigationBarItem(
                     selected = tab == 3,
                     onClick = { tab = 3 },
+                    icon = { Icon(Icons.Filled.Send, contentDescription = null) },
+                    label = { Text("Sector") },
+                )
+                NavigationBarItem(
+                    selected = tab == 4,
+                    onClick = { tab = 4 },
                     icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
                     label = { Text("Settings") },
                 )
@@ -119,7 +126,8 @@ fun AppRoot(vm: AppViewModel) {
                     }
                 }
                 1 -> MapScreen(vm, now)
-                2 -> SectorScreen(vm, now)
+                2 -> RadarScreen(vm, now)
+                3 -> SectorScreen(vm, now)
                 else -> SettingsScreen(vm)
             }
         }

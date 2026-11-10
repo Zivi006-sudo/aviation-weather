@@ -17,11 +17,11 @@ jobs:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
-      - name: Build debug APK
+      - name: Build optimised APK
         run: |
           chmod +x gradlew
           set +e
-          ./gradlew assembleDebug --no-daemon --console=plain > build.log 2>&1
+          ./gradlew assembleRelease --no-daemon --console=plain > build.log 2>&1
           code=$?
           tail -n 80 build.log
           if [ $code -ne 0 ]; then
@@ -33,12 +33,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: AviationWeather-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/release/app-release.apk
       - name: Publish APK as a release
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk AviationWeather.apk
+          cp app/build/outputs/apk/release/app-release.apk AviationWeather.apk
           gh release delete latest -y --cleanup-tag || true
           gh release create latest AviationWeather.apk --title "Aviation Weather (latest build)" --notes "Built from ${GITHUB_SHA}"

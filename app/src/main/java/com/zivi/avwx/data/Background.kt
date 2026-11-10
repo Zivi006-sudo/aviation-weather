@@ -26,6 +26,7 @@ import com.zivi.avwx.ui.MainActivity
 import com.zivi.avwx.wx.FlightCat
 import com.zivi.avwx.wx.parseMetar
 import com.zivi.avwx.wx.parseTaf
+import com.zivi.avwx.wx.pickReports
 import com.zivi.avwx.wx.shortCloud
 import com.zivi.avwx.wx.shortVis
 import com.zivi.avwx.wx.shortWind
@@ -87,16 +88,25 @@ class WxWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, pa
             return Result.success()   // offline: try again at the next run
         }
         val merged = HashMap(old)
-        merged.putAll(res.wx)
-        store.saveWx(merged)
+        for ((k, v) in res.wx) merged[k] = WxMerge.pick(merged[k], v)
 
         if (store.notify) {
             val now = Instant.now()
+            // Stations the international feed misses are read from the Maldives Met page.
+            try {
+                val picked = pickReports(MvMet.reports(ctx), now)
+                val at = System.currentTimeMillis()
+                for (a in airports) {
+                    val r = picked[a.icao] ?: continue
+                    merged[a.icao] = WxMerge.pick(merged[a.icao], StationWx(a.icao, r.first, r.second, at))
+                }
+            } catch (t: Throwable) {
+                if (t is kotlinx.coroutines.CancellationException) throw t
+            }
             val events = ArrayList<String>()
             for (a in airports) {
-                val o = old[a.icao]
-                val n = res.wx[a.icao] ?: continue
-                if (o == null) continue
+                val o = old[a.icao] ?: continue
+                val n = merged[a.icao] ?: continue
                 val oldM = o.metarRaw?.let { runCatching { parseMetar(it, now) }.getOrNull() }
                 val newM = n.metarRaw?.let { runCatching { parseMetar(it, now) }.getOrNull() }
                 val oldT = o.tafRaw?.let { runCatching { parseTaf(it, now) }.getOrNull() }
@@ -105,6 +115,7 @@ class WxWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, pa
             }
             Notifier.post(ctx, events)
         }
+        store.saveWx(merged)
         WxWidget.updateAll(ctx)
         return Result.success()
     }

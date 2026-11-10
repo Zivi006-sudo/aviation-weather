@@ -43,7 +43,12 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.MutableFloatState
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.collectLatest
+import com.zivi.avwx.data.TileSource
+import com.zivi.avwx.data.SatFrame
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -105,20 +110,11 @@ private const val DWELL_SEC = 1.2f                 // pause on the newest image 
 private val SPEEDS = floatArrayOf(1.5f, 3f, 6f)     // images per second
 private val SPEED_LABELS = arrayOf("Slow", "Normal", "Fast")
 private val SEA = Color(0xFFAAD3DF)
-private const val HOME_LON = 73.3
-private const val HOME_LAT = 3.2
 
-/** Map tiles kept in memory between visits to the screen. */
-private object TileMem {
-    val mem = LruCache<String, ImageBitmap>(140)
-    val inFlight = HashSet<String>()
-    val gate = Semaphore(2)          // the tile server asks for at most two downloads at a time
-    var tick by mutableIntStateOf(0)
-}
+private data class ViewKey(val cx: Double, val cy: Double, val scale: Double, val size: IntSize)
 
 @Composable
 fun MapScreen(vm: AppViewModel, now: Long) {
-    val ctx = LocalContext.current.applicationContext
     val haptic = LocalHapticFeedback.current
     val frames = vm.frames
     val images: List<ImageBitmap> = remember(frames) { frames.map { it.bitmap.asImageBitmap() } }
@@ -126,14 +122,11 @@ fun MapScreen(vm: AppViewModel, now: Long) {
 
     var playing by rememberSaveable { mutableStateOf(false) }
     var speedIdx by rememberSaveable { mutableStateOf(1) }
-    var pos by remember { mutableFloatStateOf(0f) }
+    // Loop position. Read only by the canvas while drawing and by the timeline panel,
+    // so the animation doesn't rebuild the rest of the screen on every frame.
+    val pos = remember { mutableFloatStateOf(0f) }
     var showSigmetList by remember { mutableStateOf(false) }
-
-    // Map view: centre in Mercator world units (0..1) and scale = width of the whole world in pixels.
-    var cx by rememberSaveable { mutableStateOf(Merc.x(HOME_LON)) }
-    var cy by rememberSaveable { mutableStateOf(Merc.y(HOME_LAT)) }
-    var scale by rememberSaveable { mutableStateOf(0.0) }
-    var viewSize by remember { mutableStateOf(IntSize.Zero) }
+    val cam = rememberSaveable(saver = MapCam.saver(13.0)) { MapCam(Merc.x(HOME_LON), Merc.y(HOME_LAT), 0.0, 13.0) }
 
     val owner = LocalLifecycleOwner.current
     LaunchedEffect(owner) {
@@ -146,41 +139,20 @@ fun MapScreen(vm: AppViewModel, now: Long) {
         }
     }
 
-    // When the map stops moving, fetch satellite images for the new view if the loaded ones don't fit it.
-    LaunchedEffect(cx, cy, scale, viewSize) {
-        if (scale <= 0.0 || viewSize.width == 0) return@LaunchedEffect
-        delay(400)
-        val vw = viewSize.width / scale
-        val vh = viewSize.height / scale
-        val view = viewBox(cx, cy, vw / 2, vh / 2, 1.0)
-        val have = vm.satRequest?.bounds
-        val fits = have != null && have.contains(view) && have.widthDeg <= view.widthDeg * 4.6
-        if (!fits) {
-            // A generous, grid-snapped area: panning nearby stays inside it, and coming back asks for the same box.
-            val b = snapBox(cx, cy, vw, vh, 2.0)
-            val want = GeoBounds(
-                west = Merc.lon(b[0].coerceIn(0.0, 1.0)),
-                south = Merc.lat(b[3].coerceIn(0.03, 0.97)),
-                east = Merc.lon(b[2].coerceIn(0.0, 1.0)),
-                north = Merc.lat(b[1].coerceIn(0.03, 0.97)),
-            )
-            val wPx: Int
-            val hPx: Int
-            if (viewSize.height >= viewSize.width) {
-                hPx = Sat.MAX_DIM
-                wPx = (Sat.MAX_DIM.toFloat() * viewSize.width / viewSize.height).roundToInt().coerceAtLeast(64)
-            } else {
-                wPx = Sat.MAX_DIM
-                hPx = (Sat.MAX_DIM.toFloat() * viewSize.height / viewSize.width).roundToInt().coerceAtLeast(64)
+    // When the map stops moving, make sure satellite images cover the new view.
+    LaunchedEffect(cam) {
+        snapshotFlow { ViewKey(cam.cx, cam.cy, cam.scale, cam.size) }.collectLatest { v ->
+            if (v.scale > 0.0 && v.size.width > 0) {
+                delay(400)
+                vm.requestSatForView(v.cx, v.cy, v.scale, v.size.width, v.size.height)
             }
-            vm.loadSat(SatRequest(want, wPx, hPx))
         }
     }
 
     // New set of images: stay where the loop is if it is playing, otherwise show the newest.
     LaunchedEffect(frames) {
         val last = (frames.size - 1).coerceAtLeast(0).toFloat()
-        pos = if (playing) pos.coerceAtMost(last) else last
+        pos.floatValue = if (playing) pos.floatValue.coerceAtMost(last) else last
     }
 
     // Animation clock, tied to the display refresh rate.
@@ -190,50 +162,18 @@ fun MapScreen(vm: AppViewModel, now: Long) {
         val speed = SPEEDS[speedIdx]
         val end = last + DWELL_SEC * speed
         var prev = withFrameNanos { it }
-        if (pos >= last) pos = 0f
+        if (pos.floatValue >= last) pos.floatValue = 0f
         while (true) {
             val t = withFrameNanos { it }
             val dt = ((t - prev) / 1_000_000_000.0).toFloat().coerceIn(0f, 0.1f)
             prev = t
-            var p = pos + dt * speed
+            var p = pos.floatValue + dt * speed
             if (p >= end) p = 0f
-            pos = p
+            pos.floatValue = p
         }
     }
 
-    // Which map tiles the view needs, and loading the ones not in memory.
-    val ready = scale > 0.0 && viewSize.width > 0
-    val tz = if (ready) floor(ln(scale / 256.0) / ln(2.0)).toInt().coerceIn(1, 12) else 1
-    val nTiles = 1 shl tz
-    val tx0 = if (ready) floor((cx - viewSize.width / 2.0 / scale) * nTiles).toInt().coerceIn(0, nTiles - 1) else 0
-    val tx1 = if (ready) floor((cx + viewSize.width / 2.0 / scale) * nTiles).toInt().coerceIn(0, nTiles - 1) else -1
-    val ty0 = if (ready) floor((cy - viewSize.height / 2.0 / scale) * nTiles).toInt().coerceIn(0, nTiles - 1) else 0
-    val ty1 = if (ready) floor((cy + viewSize.height / 2.0 / scale) * nTiles).toInt().coerceIn(0, nTiles - 1) else -1
-    LaunchedEffect(tz, tx0, tx1, ty0, ty1) {
-        if (tx1 < tx0 || ty1 < ty0 || (tx1 - tx0 + 1) * (ty1 - ty0 + 1) > 80) return@LaunchedEffect
-        for (ty in ty0..ty1) {
-            for (tx in tx0..tx1) {
-                val key = "$tz/$tx/$ty"
-                if (TileMem.mem.get(key) == null && TileMem.inFlight.add(key)) {
-                    launch {
-                        try {
-                            val bmp = TileMem.gate.withPermit { Tiles.load(ctx, tz, tx, ty) }
-                            if (bmp != null) {
-                                TileMem.mem.put(key, bmp.asImageBitmap())
-                                TileMem.tick++
-                            }
-                        } finally {
-                            TileMem.inFlight.remove(key)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    val lastIdx = (frames.size - 1).coerceAtLeast(0)
-    val shownPos = pos.coerceIn(0f, lastIdx.toFloat())
-    val nearest = shownPos.roundToInt().coerceIn(0, lastIdx)
+    TileLoader(TileSource.MAP, cam)
 
     val airports = vm.airports
     val decoded = vm.decoded
@@ -253,56 +193,17 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     }
 
     Box(Modifier.fillMaxSize().background(SEA)) {
-        Canvas(
-            Modifier
-                .fillMaxSize()
-                .clipToBounds()
-                .onSizeChanged {
-                    viewSize = it
-                    if (scale <= 0.0) scale = it.height * 360.0 / 13.0   // about 13 degrees of latitude top to bottom
-                }
-                .pointerInput(Unit) {
-                    detectTransformGestures { centroid, pan, zoom, _ ->
-                        val w = size.width.toDouble()
-                        val h = size.height.toDouble()
-                        if (scale > 0.0) {
-                            val minScale = maxOf(w, h) * 1.2
-                            val maxScale = 256.0 * 5800.0            // roughly zoom level 12.5
-                            val newScale = (scale * zoom).coerceIn(minScale, maxScale)
-                            // Keep the point under the fingers fixed while zooming.
-                            val wx = cx + (centroid.x - w / 2) / scale
-                            val wy = cy + (centroid.y - h / 2) / scale
-                            val nx = wx - (centroid.x - w / 2) / newScale - pan.x / newScale
-                            val ny = wy - (centroid.y - h / 2) / newScale - pan.y / newScale
-                            scale = newScale
-                            cx = nx.coerceIn(0.0, 1.0)
-                            cy = ny.coerceIn(0.1, 0.9)
-                        }
-                    }
-                }
-        ) {
-            val s = scale
+        Canvas(Modifier.fillMaxSize().clipToBounds().mapCamera(cam)) {
+            val s = cam.scale
             if (s > 0.0) {
                 val w = size.width
                 val h = size.height
-                val ox = cx
-                val oy = cy
+                val ox = cam.cx
+                val oy = cam.cy
 
-                // ---- base map
-                val redrawOnTile = TileMem.tick
-                if (redrawOnTile >= 0) {
-                    for (ty in ty0..ty1) {
-                        for (tx in tx0..tx1) {
-                            val l = px(w, ox, s, tx.toDouble() / nTiles).roundToInt()
-                            val t = px(h, oy, s, ty.toDouble() / nTiles).roundToInt()
-                            val r = px(w, ox, s, (tx + 1).toDouble() / nTiles).roundToInt()
-                            val b = px(h, oy, s, (ty + 1).toDouble() / nTiles).roundToInt()
-                            drawTile(tz, tx, ty, IntOffset(l, t), IntSize(r - l, b - t))
-                        }
-                    }
-                }
+                drawTiles(TileSource.MAP, cam)
 
-                // ---- satellite, then rain
+                // ---- satellite, then the extra layer
                 if (images.isNotEmpty() && frames.isNotEmpty()) {
                     val bnd = frames[0].bounds
                     val l = px(w, ox, s, Merc.x(bnd.west)).roundToInt()
@@ -311,6 +212,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                     val b = px(h, oy, s, Merc.y(bnd.south)).roundToInt()
                     val dstO = IntOffset(l, t)
                     val dstS = IntSize((r - l).coerceAtLeast(1), (b - t).coerceAtLeast(1))
+                    val shownPos = pos.floatValue.coerceIn(0f, (images.size - 1).toFloat())
                     val i = floor(shownPos).toInt().coerceIn(0, images.size - 1)
                     val frac = shownPos - i
                     // Smoothstep: holds each picture briefly, then fades to the next.
@@ -321,7 +223,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                         val nx = images[i + 1]
                         drawImage(nx, IntOffset.Zero, IntSize(nx.width, nx.height), dstO, dstS, alpha = f, filterQuality = FilterQuality.Low)
                     }
-                    val rain = rains.getOrNull(nearest)
+                    val rain = rains.getOrNull(shownPos.roundToInt())
                     if (rain != null) {
                         drawImage(rain, IntOffset.Zero, IntSize(rain.width, rain.height), dstO, dstS, alpha = 0.85f, filterQuality = FilterQuality.Low)
                     }
@@ -426,11 +328,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                 if (vm.showSigmet && vm.sigmets.isNotEmpty()) {
                     Toggle("List", false) { showSigmetList = true }
                 }
-                Toggle("Maldives", false) {
-                    cx = Merc.x(HOME_LON)
-                    cy = Merc.y(HOME_LAT)
-                    if (viewSize.height > 0) scale = viewSize.height * 360.0 / 13.0
-                }
+                Toggle("Maldives", false) { cam.home() }
             }
             if (vm.enhanced) Legend()
             val legend = vm.overlayLegend
@@ -441,7 +339,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                         fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Black,
                     )
                     Image(
-                        bitmap = legend.asImageBitmap(), contentDescription = "Colour key",
+                        bitmap = remember(legend) { legend.asImageBitmap() }, contentDescription = "Colour key",
                         contentScale = ContentScale.Fit,
                         modifier = Modifier.heightIn(max = 130.dp).widthIn(max = 130.dp),
                     )
@@ -463,79 +361,97 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                 fontSize = 9.sp, color = Color(0xFF1B2530),
                 modifier = Modifier.align(Alignment.End).padding(bottom = 4.dp, end = 4.dp),
             )
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xF010161D), RoundedCornerShape(20.dp))
-                    .padding(horizontal = 14.dp, vertical = 10.dp)
-            ) {
-                if (frames.isEmpty()) {
-                    val err = vm.satError
-                    Text(
-                        err ?: if (vm.satTotal > 0) "Loading satellite images… ${vm.satLoaded} of ${vm.satTotal}" else "Loading satellite images…",
-                        fontSize = 14.sp, color = if (err != null) Amber else MaterialTheme.colorScheme.onSurface,
-                    )
-                    if (err == null) {
-                        Spacer(Modifier.height(8.dp))
-                        LinearProgressIndicator(Modifier.fillMaxWidth())
-                    }
-                } else {
-                    val shown = frames[nearest].time
-                    val newest = frames[lastIdx].time
-                    val ageMin = ((now - newest.toEpochMilli()) / 60000L).coerceAtLeast(0)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                Fmt.zulu(shown) + "  /  " + Fmt.local(shown) + " LT",
-                                fontSize = 20.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
-                                color = Color.White,
-                            )
-                            Text(
-                                (if (nearest == lastIdx) "Latest image" else "Latest image: " + Fmt.zulu(newest)) +
-                                    " · " + Fmt.ago(newest.toEpochMilli(), now),
-                                fontSize = 12.sp,
-                                color = if (ageMin > 45) Amber else MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        Text(
-                            SPEED_LABELS[speedIdx], fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(10.dp))
-                                .clickable { speedIdx = (speedIdx + 1) % SPEEDS.size }
-                                .padding(horizontal = 10.dp, vertical = 10.dp),
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        PlayPauseButton(playing, enabled = frames.size > 1) {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            playing = !playing
-                        }
-                    }
-                    if (frames.size > 1) {
-                        Slider(
-                            value = shownPos,
-                            onValueChange = { playing = false; pos = it },
-                            onValueChangeFinished = { pos = pos.roundToInt().toFloat() },
-                            valueRange = 0f..lastIdx.toFloat(),
-                            steps = (frames.size - 2).coerceAtLeast(0),
-                        )
-                        Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(Fmt.zulu(frames.first().time), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text("${frames.size} images · every 15 min", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text(Fmt.zulu(newest), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                    val err = vm.satError
-                    if (err != null) {
-                        Text(err, fontSize = 12.sp, color = Amber, modifier = Modifier.padding(top = 4.dp))
-                    }
-                }
-            }
+            Timeline(
+                vm, frames, pos, playing, speedIdx, now,
+                onPlayPause = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    playing = !playing
+                },
+                onSpeed = { speedIdx = (speedIdx + 1) % SPEEDS.size },
+                onScrub = { playing = false; pos.floatValue = it },
+            )
         }
     }
 
     if (showSigmetList) {
         SigmetDialog(vm.sigmets) { showSigmetList = false }
+    }
+}
+
+/** The time read-out, play controls and slider. The only part of the screen rebuilt while the loop plays. */
+@Composable
+private fun Timeline(
+    vm: AppViewModel, frames: List<SatFrame>, pos: MutableFloatState, playing: Boolean, speedIdx: Int, now: Long,
+    onPlayPause: () -> Unit, onSpeed: () -> Unit, onScrub: (Float) -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(Color(0xF010161D), RoundedCornerShape(20.dp))
+            .padding(horizontal = 14.dp, vertical = 10.dp)
+    ) {
+        if (frames.isEmpty()) {
+            val err = vm.satError
+            Text(
+                err ?: if (vm.satTotal > 0) "Loading satellite images… ${vm.satLoaded} of ${vm.satTotal}" else "Loading satellite images…",
+                fontSize = 14.sp, color = if (err != null) Amber else MaterialTheme.colorScheme.onSurface,
+            )
+            if (err == null) {
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
+        } else {
+            val lastIdx = frames.size - 1
+            val shownPos = pos.floatValue.coerceIn(0f, lastIdx.toFloat())
+            val nearest = shownPos.roundToInt().coerceIn(0, lastIdx)
+            val shown = frames[nearest].time
+            val newest = frames[lastIdx].time
+            val ageMin = ((now - newest.toEpochMilli()) / 60000L).coerceAtLeast(0)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        Fmt.zulu(shown) + "  /  " + Fmt.local(shown) + " LT",
+                        fontSize = 20.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                        color = Color.White,
+                    )
+                    Text(
+                        (if (nearest == lastIdx) "Latest image" else "Latest image: " + Fmt.zulu(newest)) +
+                            " · " + Fmt.ago(newest.toEpochMilli(), now) +
+                            (if (vm.satLoading && vm.satTotal > frames.size) " · loading ${frames.size}/${vm.satTotal}" else ""),
+                        fontSize = 12.sp,
+                        color = if (ageMin > 45) Amber else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text(
+                    SPEED_LABELS[speedIdx], fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(onClick = onSpeed)
+                        .padding(horizontal = 10.dp, vertical = 10.dp),
+                )
+                Spacer(Modifier.width(4.dp))
+                PlayPauseButton(playing, enabled = frames.size > 1, onClick = onPlayPause)
+            }
+            if (frames.size > 1) {
+                Slider(
+                    value = shownPos,
+                    onValueChange = onScrub,
+                    onValueChangeFinished = { pos.floatValue = pos.floatValue.roundToInt().toFloat() },
+                    valueRange = 0f..lastIdx.toFloat(),
+                    steps = (frames.size - 2).coerceAtLeast(0),
+                )
+                Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(Fmt.zulu(frames.first().time), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("${frames.size} images · every 15 min", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(Fmt.zulu(newest), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            val err = vm.satError
+            if (err != null) {
+                Text(err, fontSize = 12.sp, color = Amber, modifier = Modifier.padding(top = 4.dp))
+            }
+        }
     }
 }
 
@@ -639,41 +555,6 @@ private fun ForecastPanel(vm: AppViewModel, grid: WxGrid?, idx: Int) {
     }
 }
 
-/** World coordinate (0..1) to a screen pixel along one axis. */
-private fun px(extent: Float, centre: Double, scale: Double, world: Double): Float =
-    (extent / 2 + (world - centre) * scale).toFloat()
-
-/** The view (or the view enlarged by [f]) as a box in degrees. */
-private fun viewBox(cx: Double, cy: Double, halfW: Double, halfH: Double, f: Double) = GeoBounds(
-    west = Merc.lon((cx - halfW * f).coerceIn(0.0, 1.0)),
-    south = Merc.lat((cy + halfH * f).coerceIn(0.03, 0.97)),
-    east = Merc.lon((cx + halfW * f).coerceIn(0.0, 1.0)),
-    north = Merc.lat((cy - halfH * f).coerceIn(0.03, 0.97)),
-)
-
-private fun DrawScope.drawTile(tz: Int, tx: Int, ty: Int, dstO: IntOffset, dstS: IntSize) {
-    val img = TileMem.mem.get("$tz/$tx/$ty")
-    if (img != null) {
-        drawImage(img, IntOffset.Zero, IntSize(img.width, img.height), dstO, dstS, filterQuality = FilterQuality.Low)
-        return
-    }
-    // Not downloaded yet: show the matching part of a coarser tile if one is in memory.
-    var up = 1
-    while (up <= 5 && tz - up >= 0) {
-        val parent = TileMem.mem.get("${tz - up}/${tx shr up}/${ty shr up}")
-        if (parent != null) {
-            val sub = parent.width shr up
-            if (sub >= 1) {
-                val ox = (tx - ((tx shr up) shl up)) * sub
-                val oy = (ty - ((ty shr up) shl up)) * sub
-                drawImage(parent, IntOffset(ox, oy), IntSize(sub, sub), dstO, dstS, filterQuality = FilterQuality.Low)
-            }
-            return
-        }
-        up++
-    }
-}
-
 private fun sigmetColour(hazard: String): Color = when (hazard.uppercase()) {
     "TS", "TSGR", "CONVECTIVE" -> Color(0xFFE5352B)
     "TURB" -> Color(0xFFE08A00)
@@ -681,22 +562,6 @@ private fun sigmetColour(hazard: String): Color = when (hazard.uppercase()) {
     "VA" -> Color(0xFF6B4E2E)
     "TC" -> Color(0xFFB01FB5)
     else -> Color(0xFF8A3FD1)
-}
-
-/** White text with a dark outline, readable over map and cloud alike. */
-private fun DrawScope.drawLabel(paint: Paint, text: String, x: Float, y: Float, centre: Boolean) {
-    paint.textAlign = if (centre) Paint.Align.CENTER else Paint.Align.LEFT
-    val stroke = 3.dp.toPx()
-    drawIntoCanvas { c ->
-        paint.color = android.graphics.Color.BLACK
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = stroke
-        c.nativeCanvas.drawText(text, x, y, paint)
-        paint.color = android.graphics.Color.WHITE
-        paint.style = Paint.Style.FILL
-        c.nativeCanvas.drawText(text, x, y, paint)
-    }
-    paint.textAlign = Paint.Align.LEFT
 }
 
 private fun DrawScope.drawGraticule(s: Double, cx: Double, cy: Double, paint: Paint) {
@@ -761,7 +626,7 @@ private fun Segmented(options: List<String>, selected: Int, onSelect: (Int) -> U
 }
 
 @Composable
-private fun Toggle(label: String, on: Boolean, onClick: () -> Unit) {
+internal fun Toggle(label: String, on: Boolean, onClick: () -> Unit) {
     Text(
         label, fontSize = 13.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.Medium,
         color = if (on) Color(0xFF06131B) else Color.White,
@@ -774,7 +639,7 @@ private fun Toggle(label: String, on: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun Note(text: String) {
+internal fun Note(text: String) {
     Text(
         text, fontSize = 12.sp, color = Amber,
         modifier = Modifier.background(Color(0xE610161D), RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 6.dp),

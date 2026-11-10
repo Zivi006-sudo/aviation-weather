@@ -167,7 +167,7 @@ private fun AirportPage(vm: AppViewModel, airport: Airport, now: Long, onBack: (
                 StormSection(al, now)
                 AloftSection(al, now)
             }
-            if (airport.icao.startsWith("VR")) NotamSection()
+            NotamSection(listOf(airport.icao))
             Spacer(Modifier.height(16.dp))
         }
     }
@@ -762,8 +762,6 @@ private fun AloftSection(al: Aloft, now: Long) {
 
 // ---------------------------------------------------------------- NOTAMs
 
-const val MACL_NOTAM_URL = "https://macl.aero/corporate/services/operational/ans"
-
 fun openUrl(ctx: android.content.Context, url: String) {
     try {
         ctx.startActivity(
@@ -771,26 +769,32 @@ fun openUrl(ctx: android.content.Context, url: String) {
                 .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
         )
     } catch (e: Exception) {
-        // No browser installed.
+        // No browser or Windy app installed.
     }
 }
 
+/** Buttons that open each airport's page on Windy, where the NOTAM tab lists its NOTAMs. */
 @Composable
-fun NotamSection() {
+fun NotamSection(icaos: List<String>) {
     val ctx = LocalContext.current
     Section("NOTAMs") {
-        Text(
-            "Open official NOTAMs (MACL)", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF06131B),
-            modifier = Modifier
-                .clip(RoundedCornerShape(12.dp))
-                .background(MaterialTheme.colorScheme.primary)
-                .clickable { openUrl(ctx, MACL_NOTAM_URL) }
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (icao in icaos) {
+                Text(
+                    if (icaos.size == 1) "Open $icao in Windy" else icao,
+                    fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF06131B),
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.primary)
+                        .clickable { openUrl(ctx, "https://www.windy.com/$icao") }
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                )
+            }
+        }
         Spacer(Modifier.height(8.dp))
         Text(
-            "Opens the Maldives Airports Company air navigation page in your browser, where the current NOTAMs are published. " +
-                "NOTAMs are not shown or decoded inside this app.",
+            "Opens the airport on Windy (the app if installed, otherwise your browser). Tap the NOTAM tab there. " +
+                "Windy's list may be incomplete, so your company briefing stays the primary source.",
             fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
