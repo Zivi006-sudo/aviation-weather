@@ -68,6 +68,24 @@ fun tafWindow(taf: Taf, from: Instant, to: Instant): TafWindow {
     return TafWindow(covered, prevailing, changes, worst)
 }
 
+class TafHour(val start: Instant, val prevailing: FlightCat, val worst: FlightCat, val thunder: Boolean)
+
+/** Hour-by-hour view of a TAF from [from] onward: the main forecast and the worst of any TEMPO / PROB group. */
+fun tafHourly(taf: Taf, from: Instant, maxHours: Int = 24): List<TafHour> {
+    val vf = taf.validFrom ?: return emptyList()
+    val vt = taf.validTo ?: return emptyList()
+    val startSec = maxOf(from.epochSecond, vf.epochSecond) / 3600 * 3600
+    var t = Instant.ofEpochSecond(maxOf(startSec, vf.epochSecond))
+    val out = ArrayList<TafHour>()
+    while (t.isBefore(vt) && out.size < maxHours) {
+        val e = minOf(t.epochSecond / 3600 * 3600 + 3600, vt.epochSecond)
+        val w = tafWindow(taf, t, Instant.ofEpochSecond(e))
+        out += TafHour(t, w.prevailing?.category ?: FlightCat.UNKNOWN, w.worst, w.thunder)
+        t = Instant.ofEpochSecond(e)
+    }
+    return out
+}
+
 /** "0730" or "07:30" -> the next time that clock time occurs in UTC (allowing up to 1 hour in the past). */
 fun parseUtcTime(text: String, now: Instant): Instant? {
     val digits = text.filter { it.isDigit() }

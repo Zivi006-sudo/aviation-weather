@@ -39,6 +39,22 @@ object Merc {
     fun metresY(lat: Double): Double = (0.5 - y(lat)) * 2.0 * R
 }
 
+/**
+ * An enlarged box around a view, snapped to a fixed set of sizes and positions so that nearby views
+ * ask for exactly the same area (and so reuse images already downloaded).
+ * All values are Mercator world units; returns west, north, east, south.
+ */
+fun snapBox(cx: Double, cy: Double, viewW: Double, viewH: Double, grow: Double): DoubleArray {
+    val k = kotlin.math.ceil(ln(viewW * grow) / ln(1.5))
+    val w = Math.pow(1.5, k)
+    val h = w * viewH / viewW
+    val gx = w / 6.0
+    val gy = h / 6.0
+    val sx = Math.round(cx / gx) * gx
+    val sy = Math.round(cy / gy) * gy
+    return doubleArrayOf(sx - w / 2, sy - h / 2, sx + w / 2, sy + h / 2)
+}
+
 /** Great-circle distance in nautical miles. */
 fun distanceNm(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
     val p1 = Math.toRadians(lat1)

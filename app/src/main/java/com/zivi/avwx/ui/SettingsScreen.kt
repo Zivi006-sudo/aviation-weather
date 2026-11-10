@@ -98,15 +98,17 @@ fun SettingsScreen(vm: AppViewModel) {
             Section("Data sources") {
                 Text(
                     "METAR, TAF and SIGMET: Aviation Weather Center (aviationweather.gov).\n" +
-                        "Satellite and rain rate: EUMETSAT Meteosat, Indian Ocean coverage, every 15 minutes.\n" +
-                        "Winds aloft: Open-Meteo model forecast.\n" +
+                        "Satellite, rain rate and cloud top height: EUMETSAT Meteosat, Indian Ocean coverage, every 15 minutes.\n" +
+                        "Upper winds, freezing level, icing, turbulence and thunderstorm risk: Open-Meteo model forecast.\n" +
+                        "NOTAMs: link to the Maldives Airports Company page.\n" +
                         "Map: © OpenStreetMap contributors.",
                     fontSize = 14.sp, lineHeight = 20.sp, color = MaterialTheme.colorScheme.onSurface,
                 )
                 Spacer(Modifier.height(10.dp))
                 Text(
                     "The cloud colour scale is applied by this app to image brightness. It shows relative cloud-top " +
-                        "cold, not a calibrated temperature. Images arrive 15–30 minutes after they are taken.",
+                        "cold, not a calibrated temperature. Images arrive 15–30 minutes after they are taken. " +
+                        "Icing, turbulence and thunderstorm risk are estimates this app works out from model data, not official forecasts.",
                     fontSize = 13.sp, lineHeight = 18.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }

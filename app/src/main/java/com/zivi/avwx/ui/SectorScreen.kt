@@ -24,6 +24,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -38,6 +39,7 @@ import com.zivi.avwx.wx.Conditions
 import com.zivi.avwx.wx.FlightCat
 import com.zivi.avwx.wx.Minima
 import com.zivi.avwx.wx.Sun
+import com.zivi.avwx.wx.Upper
 import com.zivi.avwx.wx.TafGroup
 import com.zivi.avwx.wx.TafKind
 import com.zivi.avwx.wx.belowMinima
@@ -117,6 +119,7 @@ fun SectorScreen(vm: AppViewModel, now: Long) {
             if (vm.sectorDep.length == 4) StationCard(vm, "Departure", vm.sectorDep, etd ?: nowInst, null, nowInst)
             if (vm.sectorDest.length == 4) StationCard(vm, "Destination", vm.sectorDest, eta ?: nowInst, vm.destMinima, nowInst)
             if (vm.sectorAltn.length == 4) StationCard(vm, "Alternate", vm.sectorAltn, eta ?: nowInst, vm.altnMinima, nowInst)
+            if (listOf(vm.sectorDep, vm.sectorDest, vm.sectorAltn).any { it.startsWith("VR") }) NotamSection()
             Spacer(Modifier.height(16.dp))
         }
     }
@@ -153,6 +156,11 @@ private fun StationCard(vm: AppViewModel, role: String, icao: String, at: Instan
     val taf = d?.taf
     val window = taf?.let { tafWindow(it, at.minusSeconds(3600), at.plusSeconds(3600)) }
     val soon = kotlin.math.abs(at.epochSecond - now.epochSecond) <= 3600
+    val where = vm.positionOf(icao)
+    LaunchedEffect(icao, where?.get(0), where?.get(1)) {
+        if (where != null) vm.loadAloft(icao, where[0], where[1])
+    }
+    val al = vm.aloft[icao]
 
     Section("$role · $icao", trailing = {
         Text(
@@ -233,6 +241,24 @@ private fun StationCard(vm: AppViewModel, role: String, icao: String, at: Instan
                         Spacer(Modifier.height(4.dp))
                         Text("No change groups in this period.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
+                }
+            }
+
+            // ---- upper air at this time
+            if (al != null) {
+                val i = al.indexAt(at.epochSecond)
+                val near = kotlin.math.abs(al.times[i].epochSecond - at.epochSecond) <= 5400
+                if (near) {
+                    Spacer(Modifier.height(12.dp))
+                    SmallHead("Upper air (model forecast)", FlightCat.UNKNOWN)
+                    val ts = al.thunder(i)
+                    Text(
+                        "Freezing level " + Upper.freezingLabel(al.freezingFt.getOrNull(i)) +
+                            "  ·  Thunderstorm risk " + Upper.thunderWord(ts).lowercase(),
+                        fontSize = 14.sp, color = if (ts > 0) Amber else MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text("Icing: " + (al.icingBand(i) ?: "none at FL240 and below"), fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurface)
+                    Text("Turbulence: " + (al.turbulenceBand(i) ?: "none indicated"), fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurface)
                 }
             }
 

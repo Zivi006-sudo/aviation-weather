@@ -14,6 +14,7 @@ import java.net.URL
 import com.zivi.avwx.wx.GeoBounds
 import com.zivi.avwx.wx.Merc
 import com.zivi.avwx.wx.Minima
+import com.zivi.avwx.wx.Upper
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneOffset
@@ -160,9 +161,18 @@ class Store(ctx: Context) {
         get() = prefs.getBoolean("enhanced", true)
         set(v) = prefs.edit().putBoolean("enhanced", v).apply()
 
-    var showRain: Boolean
-        get() = prefs.getBoolean("rain", false)
-        set(v) = prefs.edit().putBoolean("rain", v).apply()
+    /** Extra satellite layer: "none", "rain" or "cth". */
+    var overlay: String
+        get() = prefs.getString("overlay", "none") ?: "none"
+        set(v) = prefs.edit().putString("overlay", v).apply()
+
+    var showIcing: Boolean
+        get() = prefs.getBoolean("icing", false)
+        set(v) = prefs.edit().putBoolean("icing", v).apply()
+
+    var showWind: Boolean
+        get() = prefs.getBoolean("windArrows", false)
+        set(v) = prefs.edit().putBoolean("windArrows", v).apply()
 
     var showSigmet: Boolean
         get() = prefs.getBoolean("sigmet", true)
@@ -278,9 +288,85 @@ class Sigmet(
     val coords: List<DoubleArray>,   // [lat, lon]
 )
 
-class AloftLevel(val hPa: Int, val label: String, val speedKt: List<Double?>, val dirDeg: List<Double?>, val tempC: List<Double?>)
+class AloftLevel(
+    val hPa: Int,
+    val label: String,
+    val ft: Int,
+    val speedKt: List<Double?>,
+    val dirDeg: List<Double?>,
+    val tempC: List<Double?>,
+    val rh: List<Double?>,
+)
 
-class Aloft(val times: List<Instant>, val levels: List<AloftLevel>, val fetchedAt: Long)
+/** Model forecast over one point. Levels run from the lowest to the highest. */
+class Aloft(
+    val times: List<Instant>,
+    val levels: List<AloftLevel>,
+    val freezingFt: List<Double?>,
+    val cape: List<Double?>,
+    val precip: List<Double?>,
+    val code: List<Double?>,
+    val fetchedAt: Long,
+) {
+    /** Index of the forecast hour nearest to [epochSec]. */
+    fun indexAt(epochSec: Long): Int {
+        var idx = 0
+        var best = Long.MAX_VALUE
+        for (i in times.indices) {
+            val d = kotlin.math.abs(times[i].epochSecond - epochSec)
+            if (d < best) { best = d; idx = i }
+        }
+        return idx
+    }
+
+    fun icing(level: Int, i: Int): Int = Upper.icing(levels[level].tempC.getOrNull(i), levels[level].rh.getOrNull(i))
+
+    /** Turbulence risk at a level, from the stronger of the wind shears to the levels below and above. */
+    fun turbulence(level: Int, i: Int): Int {
+        var worst = 0.0
+        for (other in intArrayOf(level - 1, level + 1)) {
+            if (other < 0 || other >= levels.size) continue
+            val a = levels[level]
+            val b = levels[other]
+            val s1 = a.speedKt.getOrNull(i) ?: continue
+            val d1 = a.dirDeg.getOrNull(i) ?: continue
+            val s2 = b.speedKt.getOrNull(i) ?: continue
+            val d2 = b.dirDeg.getOrNull(i) ?: continue
+            worst = maxOf(worst, Upper.shear(s1, d1, a.ft, s2, d2, b.ft))
+        }
+        return Upper.turbulence(worst)
+    }
+
+    fun thunder(i: Int): Int = Upper.thunder(cape.getOrNull(i), precip.getOrNull(i), code.getOrNull(i))
+    fun icingBand(i: Int): String? = Upper.band(levels.indices.map { icing(it, i) })
+    fun turbulenceBand(i: Int): String? = Upper.band(levels.indices.map { turbulence(it, i) })
+}
+
+/** Forecast at one level on a grid of points, for the map layers. Values are NaN where missing. */
+class WxGrid(
+    val key: String,
+    val level: Int,
+    val lats: DoubleArray,
+    val lons: DoubleArray,
+    val dLat: Double,
+    val dLon: Double,
+    val times: List<Instant>,
+    val speed: Array<FloatArray>,   // [point][hour]
+    val dir: Array<FloatArray>,
+    val temp: Array<FloatArray>,
+    val rh: Array<FloatArray>,
+    val fetchedAt: Long,
+) {
+    fun indexAt(epochSec: Long): Int {
+        var idx = 0
+        var best = Long.MAX_VALUE
+        for (i in times.indices) {
+            val d = kotlin.math.abs(times[i].epochSecond - epochSec)
+            if (d < best) { best = d; idx = i }
+        }
+        return idx
+    }
+}
 
 object ExtraApi {
     private const val BASE = "https://aviationweather.gov/api/data"
@@ -338,24 +424,79 @@ object ExtraApi {
         out
     }
 
-    private val LEVELS = listOf(925 to "2,500 ft", 850 to "5,000 ft", 700 to "FL100", 600 to "FL140", 500 to "FL180", 400 to "FL240")
-
-    /** Forecast wind and temperature at flight levels over a point (Open-Meteo, global models). */
-    suspend fun aloft(lat: Double, lon: Double): Aloft = withContext(Dispatchers.IO) {
-        val vars = LEVELS.joinToString(",") { (p, _) -> "wind_speed_${p}hPa,wind_direction_${p}hPa,temperature_${p}hPa" }
-        val url = "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&hourly=$vars" +
-            "&wind_speed_unit=kn&forecast_days=2&timezone=GMT"
-        val h = JSONObject(Net.getText(url)).getJSONObject("hourly")
+    private fun parseTimes(h: JSONObject): List<Instant> {
         val tArr = h.getJSONArray("time")
-        val times = (0 until tArr.length()).map { LocalDateTime.parse(tArr.getString(it)).toInstant(ZoneOffset.UTC) }
+        return (0 until tArr.length()).map { LocalDateTime.parse(tArr.getString(it)).toInstant(ZoneOffset.UTC) }
+    }
+
+    /** Forecast wind, temperature, humidity, freezing level and storm indicators over a point (Open-Meteo). */
+    suspend fun aloft(lat: Double, lon: Double): Aloft = withContext(Dispatchers.IO) {
+        val vars = Upper.LEVELS_HPA.joinToString(",") { p ->
+            "wind_speed_${p}hPa,wind_direction_${p}hPa,temperature_${p}hPa,relative_humidity_${p}hPa"
+        }
+        val url = "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&hourly=$vars" +
+            ",freezing_level_height,cape,precipitation,weather_code&wind_speed_unit=kn&forecast_days=2&timezone=GMT"
+        val h = JSONObject(Net.getText(url)).getJSONObject("hourly")
+        val times = parseTimes(h)
         fun col(name: String): List<Double?> {
             val a = h.optJSONArray(name) ?: return List(times.size) { null }
             return (0 until a.length()).map { if (a.isNull(it)) null else a.optDouble(it) }
         }
-        val levels = LEVELS.map { (p, label) ->
-            AloftLevel(p, label, col("wind_speed_${p}hPa"), col("wind_direction_${p}hPa"), col("temperature_${p}hPa"))
+        val levels = Upper.LEVELS_HPA.mapIndexed { i, p ->
+            AloftLevel(
+                p, Upper.label(i), Upper.LEVELS_FT[i],
+                col("wind_speed_${p}hPa"), col("wind_direction_${p}hPa"), col("temperature_${p}hPa"), col("relative_humidity_${p}hPa"),
+            )
         }
-        Aloft(times, levels, System.currentTimeMillis())
+        Aloft(
+            times, levels,
+            freezingFt = col("freezing_level_height").map { it?.times(3.28084) },
+            cape = col("cape"), precip = col("precipitation"), code = col("weather_code"),
+            fetchedAt = System.currentTimeMillis(),
+        )
+    }
+
+    /** Wind, temperature and humidity at one level on a grid of points covering [b]. */
+    suspend fun grid(b: GeoBounds, level: Int, key: String): WxGrid = withContext(Dispatchers.IO) {
+        val cols = 6
+        val rows = 8
+        val dLon = (b.east - b.west) / cols
+        val dLat = (b.north - b.south) / rows
+        val n = cols * rows
+        val lats = DoubleArray(n)
+        val lons = DoubleArray(n)
+        for (r in 0 until rows) for (c in 0 until cols) {
+            lats[r * cols + c] = b.north - (r + 0.5) * dLat
+            lons[r * cols + c] = b.west + (c + 0.5) * dLon
+        }
+        val p = Upper.LEVELS_HPA[level]
+        val us = java.util.Locale.US
+        val url = "https://api.open-meteo.com/v1/forecast" +
+            "?latitude=" + lats.joinToString(",") { "%.2f".format(us, it) } +
+            "&longitude=" + lons.joinToString(",") { "%.2f".format(us, it) } +
+            "&hourly=wind_speed_${p}hPa,wind_direction_${p}hPa,temperature_${p}hPa,relative_humidity_${p}hPa" +
+            "&wind_speed_unit=kn&forecast_days=2&timezone=GMT"
+        val text = Net.getText(url, maxBytes = 4_000_000).trim()
+        val arr = if (text.startsWith("[")) JSONArray(text) else JSONArray().put(JSONObject(text))
+        if (arr.length() < n) throw java.io.IOException("grid incomplete")
+        var times: List<Instant> = emptyList()
+        fun col(h: JSONObject, name: String, size: Int): FloatArray {
+            val a = h.optJSONArray(name)
+            return FloatArray(size) { i -> if (a == null || i >= a.length() || a.isNull(i)) Float.NaN else a.optDouble(i).toFloat() }
+        }
+        val speed = ArrayList<FloatArray>()
+        val dir = ArrayList<FloatArray>()
+        val temp = ArrayList<FloatArray>()
+        val rh = ArrayList<FloatArray>()
+        for (i in 0 until n) {
+            val h = arr.getJSONObject(i).getJSONObject("hourly")
+            if (i == 0) times = parseTimes(h)
+            speed += col(h, "wind_speed_${p}hPa", times.size)
+            dir += col(h, "wind_direction_${p}hPa", times.size)
+            temp += col(h, "temperature_${p}hPa", times.size)
+            rh += col(h, "relative_humidity_${p}hPa", times.size)
+        }
+        WxGrid(key, level, lats, lons, dLat, dLon, times, speed.toTypedArray(), dir.toTypedArray(), temp.toTypedArray(), rh.toTypedArray(), System.currentTimeMillis())
     }
 }
 
@@ -398,20 +539,59 @@ class SatRequest(val bounds: GeoBounds, val width: Int, val height: Int) {
         .replace('-', 'm').replace('.', 'p')
 }
 
-class SatFrame(val time: Instant, val bitmap: Bitmap, val rain: Bitmap?, val bounds: GeoBounds)
+class SatFrame(val time: Instant, val bitmap: Bitmap, val overlay: Bitmap?, val bounds: GeoBounds)
+
+/** Extra EUMETSAT products that can be laid over the cloud picture. */
+enum class Overlay(val key: String, val guesses: List<String>, val match: Regex) {
+    NONE("none", emptyList(), Regex("$^")),
+    RAIN("rain", listOf("msg_iodc:h63", "msg_iodc:mpe", "msg_iodc:h60b"), Regex("(^|:)(h63|h60b?|mpe)$")),
+    TOPS("cth", listOf("msg_iodc:cth"), Regex("(^|:)cth$"));
+
+    companion object {
+        fun of(key: String): Overlay = values().firstOrNull { it.key == key } ?: NONE
+    }
+}
 
 object Sat {
     const val STEP_MIN = 15L
-    const val MAX_DIM = 768
+    const val MAX_DIM = 1024
 
     private const val WMS = "https://view.eumetsat.int/geoserver/wms"
     private const val LAYER = "msg_iodc%3Air108"
-    private val RAIN_LAYERS = listOf("msg_iodc%3Ah63", "msg_iodc%3Ampe", "msg_iodc%3Ah60b")
     private val ISO_RE = Regex("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z")
+    private val NAME_RE = Regex("<Name>([^<]+)</Name>")
 
-    @Volatile private var rainLayer: String? = null
-    @Volatile var rainUnavailable = false
-        private set
+    private val resolved = java.util.concurrent.ConcurrentHashMap<Overlay, String>()
+    private val missing = java.util.concurrent.ConcurrentHashMap<Overlay, Boolean>()
+    @Volatile private var serverLayers: List<String>? = null
+    @Volatile private var latestCached: Instant? = null
+    @Volatile private var latestAt = 0L
+
+    fun unavailable(o: Overlay): Boolean = missing[o] == true
+
+    /** Layer names the server lists for the Indian Ocean satellite, read once. */
+    private fun listLayers(): List<String> {
+        serverLayers?.let { return it }
+        val names = try {
+            val xml = Net.getText(
+                "https://view.eumetsat.int/geoserver/msg_iodc/wms?service=WMS&version=1.1.1&request=GetCapabilities",
+                maxBytes = 3_000_000,
+            )
+            NAME_RE.findAll(xml).map { it.groupValues[1].trim() }.toList()
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        serverLayers = names
+        return names
+    }
+
+    /** Names to try for an overlay: what the server lists first, then the usual names. */
+    private fun candidates(o: Overlay): List<String> {
+        resolved[o]?.let { return listOf(it) }
+        val found = listLayers().filter { o.match.containsMatchIn(it.lowercase()) }
+            .map { if (it.contains(":")) it else "msg_iodc:$it" }
+        return (found + o.guesses).distinct()
+    }
 
     private fun floorToStep(t: Instant): Instant {
         val step = STEP_MIN * 60
@@ -420,9 +600,19 @@ object Sat {
 
     /** Time of the newest image the server lists; falls back to an estimate if the listing can't be read. */
     suspend fun latestTime(): Instant = withContext(Dispatchers.IO) {
+        val cached = latestCached
+        if (cached != null && System.currentTimeMillis() - latestAt < 120_000L) return@withContext cached
+        val t = fetchLatestTime()
+        latestCached = t
+        latestAt = System.currentTimeMillis()
+        t
+    }
+
+    private fun fetchLatestTime(): Instant {
         val now = Instant.now()
         val estimate = floorToStep(now.minusSeconds(20 * 60))
         try {
+            // (plain function: runs on the caller's background thread)
             val xml = Net.getText(
                 "https://view.eumetsat.int/geoserver/msg_iodc/ir108/wms?service=WMS&version=1.1.1&request=GetCapabilities",
                 maxBytes = 600_000,
@@ -435,9 +625,9 @@ object Sat {
                 if (t.isAfter(limit) || t.isBefore(floor)) continue
                 if (best == null || t.isAfter(best)) best = t
             }
-            best?.let { floorToStep(it) } ?: estimate
+            return best?.let { floorToStep(it) } ?: estimate
         } catch (e: Exception) {
-            estimate
+            return estimate
         }
     }
 
@@ -488,28 +678,41 @@ object Sat {
         }
     }
 
-    /** Rain-rate overlay (transparent where dry). Tries the layer names EUMETSAT uses until one answers. */
-    suspend fun loadRain(ctx: Context, time: Instant, req: SatRequest): Bitmap? = withContext(Dispatchers.IO) {
-        if (rainUnavailable) return@withContext null
-        val f = File(cacheDir(ctx), "rr_${time.epochSecond}_${req.key}.png")
+    /** An overlay picture (transparent where there is nothing to show) for [time]. */
+    suspend fun loadOverlay(ctx: Context, o: Overlay, time: Instant, req: SatRequest): Bitmap? = withContext(Dispatchers.IO) {
+        if (o == Overlay.NONE || unavailable(o)) return@withContext null
+        val f = File(cacheDir(ctx), "${o.key}_${time.epochSecond}_${req.key}.png")
         try {
             if (f.exists() && f.length() > 100) {
                 return@withContext BitmapFactory.decodeFile(f.absolutePath)
             }
-            val candidates = rainLayer?.let { listOf(it) } ?: RAIN_LAYERS
-            for (layer in candidates) {
+            for (layer in candidates(o)) {
                 val bytes = try {
-                    Net.getBytes(mapUrl(layer, "image%2Fpng", time, true, req))
+                    Net.getBytes(mapUrl(layer.replace(":", "%3A"), "image%2Fpng", time, true, req))
                 } catch (e: Exception) {
                     continue
                 }
                 val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: continue
-                rainLayer = layer
+                resolved[o] = layer
                 f.writeBytes(bytes)
                 return@withContext bmp
             }
-            if (rainLayer == null) rainUnavailable = true
+            if (resolved[o] == null) missing[o] = true
             null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** The server's own colour key for an overlay, once its layer is known. */
+    suspend fun loadLegend(o: Overlay): Bitmap? = withContext(Dispatchers.IO) {
+        val layer = resolved[o] ?: return@withContext null
+        try {
+            val bytes = Net.getBytes(
+                "$WMS?service=WMS&version=1.1.1&request=GetLegendGraphic&format=image%2Fpng&layer=" + layer.replace(":", "%3A"),
+                maxBytes = 500_000,
+            )
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         } catch (e: Exception) {
             null
         }

@@ -4,6 +4,12 @@ import android.graphics.Paint
 import android.graphics.Typeface
 import android.util.LruCache
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -75,7 +81,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import com.zivi.avwx.data.Overlay
 import com.zivi.avwx.data.Sat
+import com.zivi.avwx.data.WxGrid
+import com.zivi.avwx.wx.Upper
+import com.zivi.avwx.wx.snapBox
 import com.zivi.avwx.data.SatRequest
 import com.zivi.avwx.data.Sigmet
 import com.zivi.avwx.data.Tiles
@@ -112,7 +122,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     val haptic = LocalHapticFeedback.current
     val frames = vm.frames
     val images: List<ImageBitmap> = remember(frames) { frames.map { it.bitmap.asImageBitmap() } }
-    val rains: List<ImageBitmap?> = remember(frames) { frames.map { it.rain?.asImageBitmap() } }
+    val rains: List<ImageBitmap?> = remember(frames) { frames.map { it.overlay?.asImageBitmap() } }
 
     var playing by rememberSaveable { mutableStateOf(false) }
     var speedIdx by rememberSaveable { mutableStateOf(1) }
@@ -139,14 +149,21 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     // When the map stops moving, fetch satellite images for the new view if the loaded ones don't fit it.
     LaunchedEffect(cx, cy, scale, viewSize) {
         if (scale <= 0.0 || viewSize.width == 0) return@LaunchedEffect
-        delay(650)
-        val halfW = viewSize.width / 2.0 / scale
-        val halfH = viewSize.height / 2.0 / scale
-        val view = viewBox(cx, cy, halfW, halfH, 1.0)
+        delay(400)
+        val vw = viewSize.width / scale
+        val vh = viewSize.height / scale
+        val view = viewBox(cx, cy, vw / 2, vh / 2, 1.0)
         val have = vm.satRequest?.bounds
-        val fits = have != null && have.contains(view) && have.widthDeg <= view.widthDeg * 2.6
+        val fits = have != null && have.contains(view) && have.widthDeg <= view.widthDeg * 4.6
         if (!fits) {
-            val want = viewBox(cx, cy, halfW, halfH, 1.6)
+            // A generous, grid-snapped area: panning nearby stays inside it, and coming back asks for the same box.
+            val b = snapBox(cx, cy, vw, vh, 2.0)
+            val want = GeoBounds(
+                west = Merc.lon(b[0].coerceIn(0.0, 1.0)),
+                south = Merc.lat(b[3].coerceIn(0.03, 0.97)),
+                east = Merc.lon(b[2].coerceIn(0.0, 1.0)),
+                north = Merc.lat(b[1].coerceIn(0.03, 0.97)),
+            )
             val wPx: Int
             val hPx: Int
             if (viewSize.height >= viewSize.width) {
@@ -221,6 +238,13 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     val airports = vm.airports
     val decoded = vm.decoded
     val sigmets = if (vm.showSigmet) vm.sigmets else emptyList()
+    val grid = vm.grid
+    val gridOn = vm.showIcing || vm.showWind
+    val gridIdx = remember(grid, vm.gridHour, now / 600_000L) {
+        grid?.indexAt(now / 1000 + vm.gridHour * 3600L) ?: 0
+    }
+    val showIcing = vm.showIcing
+    val showWind = vm.showWind
     val labelPaint = remember {
         Paint().apply {
             isAntiAlias = true
@@ -303,6 +327,12 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                     }
                 }
 
+                // ---- forecast layers: icing cells, then wind arrows
+                if (grid != null && gridOn && gridIdx < grid.times.size) {
+                    if (showIcing) drawIcing(grid, gridIdx, w, h, ox, oy, s)
+                    if (showWind) drawWind(grid, gridIdx, w, h, ox, oy, s, labelPaint)
+                }
+
                 // ---- SIGMET areas
                 labelPaint.textSize = 11.sp.toPx()
                 for (sg in sigmets) {
@@ -377,8 +407,18 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                     }
                 }
             }
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Toggle("Rain", vm.showRain) { vm.updateShowRain(!vm.showRain) }
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Toggle("Rain", vm.overlay == Overlay.RAIN) {
+                    vm.updateOverlay(if (vm.overlay == Overlay.RAIN) Overlay.NONE else Overlay.RAIN)
+                }
+                Toggle("Tops", vm.overlay == Overlay.TOPS) {
+                    vm.updateOverlay(if (vm.overlay == Overlay.TOPS) Overlay.NONE else Overlay.TOPS)
+                }
+                Toggle("Icing", vm.showIcing) { vm.updateShowIcing(!vm.showIcing) }
+                Toggle("Wind", vm.showWind) { vm.updateShowWind(!vm.showWind) }
                 Toggle(
                     if (vm.showSigmet && vm.sigmetsLoaded) "SIGMET ${vm.sigmets.size}" else "SIGMET",
                     vm.showSigmet,
@@ -386,7 +426,6 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                 if (vm.showSigmet && vm.sigmets.isNotEmpty()) {
                     Toggle("List", false) { showSigmetList = true }
                 }
-                Spacer(Modifier.weight(1f))
                 Toggle("Maldives", false) {
                     cx = Merc.x(HOME_LON)
                     cy = Merc.y(HOME_LAT)
@@ -394,13 +433,31 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                 }
             }
             if (vm.enhanced) Legend()
-            if (vm.showRain && vm.rainMissing) {
-                Note("Rain layer isn't available from EUMETSAT right now.")
+            val legend = vm.overlayLegend
+            if (vm.overlay != Overlay.NONE && legend != null) {
+                Column(Modifier.background(Color.White, RoundedCornerShape(8.dp)).padding(4.dp)) {
+                    Text(
+                        if (vm.overlay == Overlay.RAIN) "Rain rate" else "Cloud top height",
+                        fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Black,
+                    )
+                    Image(
+                        bitmap = legend.asImageBitmap(), contentDescription = "Colour key",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.heightIn(max = 130.dp).widthIn(max = 130.dp),
+                    )
+                }
+            }
+            if (vm.overlay != Overlay.NONE && vm.overlayMissing) {
+                Note((if (vm.overlay == Overlay.RAIN) "The rain layer" else "The cloud top layer") + " isn't available from EUMETSAT right now.")
             }
         }
 
         // ---- timeline
         Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(12.dp)) {
+            if (gridOn) {
+                ForecastPanel(vm, grid, gridIdx)
+                Spacer(Modifier.height(6.dp))
+            }
             Text(
                 "Map © OpenStreetMap contributors, CARTO · Satellite © EUMETSAT",
                 fontSize = 9.sp, color = Color(0xFF1B2530),
@@ -479,6 +536,106 @@ fun MapScreen(vm: AppViewModel, now: Long) {
 
     if (showSigmetList) {
         SigmetDialog(vm.sigmets) { showSigmetList = false }
+    }
+}
+
+private val ICING_COLOURS = arrayOf(Color(0x5538BDF8), Color(0x771E6FD9), Color(0x99B01FB5))
+
+/** Icing risk as tinted cells, one per forecast grid point. */
+private fun DrawScope.drawIcing(g: WxGrid, ti: Int, w: Float, h: Float, ox: Double, oy: Double, s: Double) {
+    for (i in g.lats.indices) {
+        val t = g.temp[i][ti]
+        val rh = g.rh[i][ti]
+        if (t.isNaN() || rh.isNaN()) continue
+        val risk = Upper.icing(t.toDouble(), rh.toDouble())
+        if (risk == 0) continue
+        val l = px(w, ox, s, Merc.x(g.lons[i] - g.dLon / 2))
+        val r = px(w, ox, s, Merc.x(g.lons[i] + g.dLon / 2))
+        val top = px(h, oy, s, Merc.y(g.lats[i] + g.dLat / 2))
+        val bottom = px(h, oy, s, Merc.y(g.lats[i] - g.dLat / 2))
+        if (r < 0f || l > w || bottom < 0f || top > h) continue
+        drawRect(ICING_COLOURS[risk - 1], topLeft = Offset(l, top), size = Size(r - l, bottom - top))
+    }
+}
+
+/** Wind arrows pointing the way the air is moving, with the speed in knots beside each. */
+private fun DrawScope.drawWind(g: WxGrid, ti: Int, w: Float, h: Float, ox: Double, oy: Double, s: Double, paint: Paint) {
+    val len = 13.dp.toPx()
+    val head = 5.dp.toPx()
+    val dark = Color(0xFF0B2233)
+    paint.textSize = 11.sp.toPx()
+    for (i in g.lats.indices) {
+        val spd = g.speed[i][ti]
+        val dir = g.dir[i][ti]
+        if (spd.isNaN() || dir.isNaN()) continue
+        val x = px(w, ox, s, Merc.x(g.lons[i]))
+        val y = px(h, oy, s, Merc.y(g.lats[i]))
+        if (x < -30f || y < -30f || x > w + 30f || y > h + 30f) continue
+        val c = Offset(x, y)
+        rotate(degrees = dir + 180f, pivot = c) {
+            val tail = Offset(x, y + len)
+            val tip = Offset(x, y - len)
+            for (pass in 0..1) {
+                val col = if (pass == 0) Color.White else dark
+                val sw = if (pass == 0) 4.5.dp.toPx() else 2.2.dp.toPx()
+                drawLine(col, tail, tip, strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(col, tip, Offset(x - head, y - len + head * 1.4f), strokeWidth = sw, cap = StrokeCap.Round)
+                drawLine(col, tip, Offset(x + head, y - len + head * 1.4f), strokeWidth = sw, cap = StrokeCap.Round)
+            }
+        }
+        drawLabel(paint, spd.roundToInt().toString(), x + len * 0.9f, y + len * 1.3f, centre = true)
+    }
+}
+
+/** Level and forecast-time controls for the icing and wind layers. */
+@Composable
+private fun ForecastPanel(vm: AppViewModel, grid: WxGrid?, idx: Int) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(Color(0xF010161D), RoundedCornerShape(16.dp))
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                Upper.label(vm.gridLevel), fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF06131B),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.primary)
+                    .clickable { vm.updateGridLevel((vm.gridLevel + 1) % Upper.LEVELS_FT.size) }
+                    .padding(horizontal = 10.dp, vertical = 7.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            val valid = grid?.times?.getOrNull(idx)
+            val err = vm.gridError
+            Text(
+                when {
+                    vm.gridLoading -> "Loading forecast…"
+                    grid == null && err != null -> err
+                    valid != null -> "Forecast " + Fmt.zulu(valid) + " / " + Fmt.local(valid) + " LT" +
+                        (if (vm.gridHour == 0) "  (now)" else "  (+${vm.gridHour} h)")
+                    else -> "Forecast"
+                },
+                fontSize = 13.sp, color = if (grid == null && err != null) Amber else Color.White, modifier = Modifier.weight(1f),
+            )
+        }
+        Slider(
+            value = vm.gridHour.toFloat(),
+            onValueChange = { vm.updateGridHour(it.roundToInt()) },
+            valueRange = 0f..24f,
+            steps = 23,
+        )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Tap the level to change it.", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+            if (vm.showIcing) {
+                Text("Icing:", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val names = listOf("light", "mod", "high")
+                for (k in 0..2) {
+                    Box(Modifier.size(10.dp).background(ICING_COLOURS[k].copy(alpha = 1f), RoundedCornerShape(2.dp)))
+                    Text(names[k], fontSize = 10.sp, color = Color.White)
+                }
+            }
+        }
     }
 }
 

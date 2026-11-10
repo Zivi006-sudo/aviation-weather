@@ -8,7 +8,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zivi.avwx.data.Airport
 import com.zivi.avwx.data.Aloft
+import android.graphics.Bitmap
 import com.zivi.avwx.data.ExtraApi
+import com.zivi.avwx.data.Overlay
+import com.zivi.avwx.data.WxGrid
 import com.zivi.avwx.data.Sat
 import com.zivi.avwx.data.SatFrame
 import com.zivi.avwx.data.SatRequest
@@ -24,8 +27,6 @@ import com.zivi.avwx.wx.Taf
 import com.zivi.avwx.wx.parseMetar
 import com.zivi.avwx.wx.parseTaf
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
@@ -200,20 +201,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Winds and temperatures aloft over the airport. Re-fetched at most hourly. */
-    fun loadAloft(a: Airport) {
-        val lat = a.lat ?: return
-        val lon = a.lon ?: return
-        val have = aloft[a.icao]
+    /** Upper-air forecast over a station. Re-fetched at most hourly. */
+    fun loadAloft(icao: String, lat: Double, lon: Double) {
+        val have = aloft[icao]
         if (have != null && System.currentTimeMillis() - have.fetchedAt < 60 * 60_000L) return
-        if (!loadingExtra.add("a${a.icao}")) return
+        if (!loadingExtra.add("a$icao")) return
         viewModelScope.launch {
             try {
-                aloft = aloft + (a.icao to ExtraApi.aloft(lat, lon))
+                aloft = aloft + (icao to ExtraApi.aloft(lat, lon))
             } catch (e: Exception) {
                 // Optional section.
             } finally {
-                loadingExtra.remove("a${a.icao}")
+                loadingExtra.remove("a$icao")
             }
         }
     }
@@ -292,11 +291,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var enhanced by mutableStateOf(store.enhanced)
         private set
-    var showRain by mutableStateOf(store.showRain)
+    var overlay by mutableStateOf(Overlay.of(store.overlay))
+        private set
+    var overlayMissing by mutableStateOf(false)
+        private set
+    var overlayLegend by mutableStateOf<Bitmap?>(null)
         private set
     var showSigmet by mutableStateOf(store.showSigmet)
-        private set
-    var rainMissing by mutableStateOf(false)
         private set
     var loopHours by mutableStateOf(store.loopHours.coerceIn(1, 3))
         private set
@@ -304,11 +305,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     private var satJob: Job? = null
+    private var framesTag = ""
+    private var legendFor: Overlay? = null
     var satRequest: SatRequest? = null
         private set
 
     fun updateEnhanced(v: Boolean) { if (v != enhanced) { enhanced = v; store.enhanced = v; reloadSat() } }
-    fun updateShowRain(v: Boolean) { if (v != showRain) { showRain = v; store.showRain = v; reloadSat() } }
+    fun updateOverlay(o: Overlay) {
+        if (o == overlay) return
+        overlay = o
+        store.overlay = o.key
+        overlayLegend = null
+        legendFor = null
+        overlayMissing = false
+        reloadSat()
+    }
     fun updateShowSigmet(v: Boolean) { showSigmet = v; store.showSigmet = v; if (v) loadSigmets() }
     fun updateLoopHours(h: Int) { if (h != loopHours) { loopHours = h; store.loopHours = h; reloadSat() } }
     fun previewSensitivity(v: Float) { sensitivity = v }
@@ -319,7 +330,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         loadSat(req)
     }
 
-    /** Reloads only when the server has a newer image than the one on screen. */
+    /** Fetches the new image when the server has one newer than the newest on screen. */
     fun checkSatUpdate() {
         if (satLoading || satRequest == null) return
         viewModelScope.launch {
@@ -329,13 +340,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Loads the loop for [req]. The newest image is fetched and shown first, the older ones fill in behind it,
+     * and images already on screen for the same area and settings are kept instead of fetched again.
+     */
     fun loadSat(req: SatRequest) {
         satJob?.cancel()
         satRequest = req
+        ensureGrid()
         val ctx = getApplication<Application>()
         val hours = loopHours
         val lut = Sat.buildLut(sensitivity, enhanced)
-        val wantRain = showRain
+        val kind = overlay
+        val tag = req.key + "|" + enhanced + "|" + sensitivity + "|" + kind.key
+        val keep: Map<Long, SatFrame> = if (tag == framesTag) frames.associateBy { it.time.epochSecond } else emptyMap()
         satJob = viewModelScope.launch {
             satLoading = true
             satError = null
@@ -344,35 +362,95 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val latest = Sat.latestTime()
                 val times = Sat.frameTimes(latest, hours)
                 satTotal = times.size
-                val gate = Semaphore(4)
-                val loaded = coroutineScope {
-                    times.map { t ->
-                        async {
-                            gate.withPermit {
-                                val grey = Sat.loadGrey(ctx, t, req)
-                                val frame = if (grey == null) null else {
-                                    val bmp = Sat.colourise(grey, lut)
-                                    grey.recycle()
-                                    val rain = if (wantRain) Sat.loadRain(ctx, t, req) else null
-                                    SatFrame(t, bmp, rain, req.bounds)
-                                }
-                                satLoaded += 1
-                                frame
-                            }
-                        }
-                    }.awaitAll()
-                }.filterNotNull()
-                rainMissing = wantRain && Sat.rainUnavailable
-                if (loaded.isEmpty()) {
+                val done = HashMap<Long, SatFrame>()
+                for (t in times) keep[t.epochSecond]?.let { done[t.epochSecond] = it }
+                satLoaded = done.size
+
+                suspend fun fetch(t: Instant) {
+                    val grey = Sat.loadGrey(ctx, t, req)
+                    if (grey != null) {
+                        val bmp = Sat.colourise(grey, lut)
+                        grey.recycle()
+                        val extra = Sat.loadOverlay(ctx, kind, t, req)
+                        done[t.epochSecond] = SatFrame(t, bmp, extra, req.bounds)
+                        frames = times.mapNotNull { done[it.epochSecond] }
+                        framesTag = tag
+                    }
+                    satLoaded += 1
+                }
+
+                if (done.isNotEmpty()) {
+                    frames = times.mapNotNull { done[it.epochSecond] }
+                }
+                val newest = times.last()
+                if (done[newest.epochSecond] == null) fetch(newest)
+                val gate = Semaphore(5)
+                coroutineScope {
+                    for (t in times.dropLast(1).reversed()) {
+                        if (done[t.epochSecond] != null) continue
+                        launch { gate.withPermit { fetch(t) } }
+                    }
+                }
+                overlayMissing = kind != Overlay.NONE && Sat.unavailable(kind)
+                if (kind != Overlay.NONE && legendFor != kind && !overlayMissing) {
+                    val legend = Sat.loadLegend(kind)
+                    if (legend != null) { overlayLegend = legend; legendFor = kind }
+                }
+                if (done.isEmpty()) {
                     satError = if (frames.isEmpty()) "No satellite images for this area. Check your connection, or move the map."
                     else "Couldn't load images here. Showing the last ones loaded."
-                } else {
-                    frames = loaded
                 }
                 Sat.trimCache(ctx)
             } finally {
                 // A newer load may already have replaced this one; only the current load clears the flag.
                 if (satJob === coroutineContext[Job]) satLoading = false
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ forecast map layers (icing, wind)
+
+    var showIcing by mutableStateOf(store.showIcing)
+        private set
+    var showWind by mutableStateOf(store.showWind)
+        private set
+    var gridLevel by mutableStateOf(3)      // index into Upper.LEVELS_FT: FL140
+        private set
+    var gridHour by mutableStateOf(0)       // hours ahead of now
+        private set
+    var grid by mutableStateOf<WxGrid?>(null)
+        private set
+    var gridLoading by mutableStateOf(false)
+        private set
+    var gridError by mutableStateOf<String?>(null)
+        private set
+    private var gridJob: Job? = null
+
+    fun updateShowIcing(v: Boolean) { showIcing = v; store.showIcing = v; ensureGrid() }
+    fun updateShowWind(v: Boolean) { showWind = v; store.showWind = v; ensureGrid() }
+    fun updateGridLevel(i: Int) { gridLevel = i; ensureGrid() }
+    fun updateGridHour(h: Int) { gridHour = h }
+
+    /** Fetches the forecast grid for the area on screen when a forecast layer is on and the data isn't there yet. */
+    fun ensureGrid() {
+        if (!showIcing && !showWind) return
+        val req = satRequest ?: return
+        val level = gridLevel
+        val key = req.key + "|" + level
+        val have = grid
+        if (have != null && have.key == key && System.currentTimeMillis() - have.fetchedAt < 60 * 60_000L) return
+        gridJob?.cancel()
+        gridJob = viewModelScope.launch {
+            gridLoading = true
+            try {
+                grid = ExtraApi.grid(req.bounds, level, key)
+                gridError = null
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                gridError = "Couldn't load the forecast layer."
+            } finally {
+                if (gridJob === coroutineContext[Job]) gridLoading = false
             }
         }
     }

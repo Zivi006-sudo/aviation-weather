@@ -34,6 +34,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import com.zivi.avwx.data.Aloft
 import com.zivi.avwx.wx.Sun
+import com.zivi.avwx.wx.Upper
+import com.zivi.avwx.wx.tafHourly
 import com.zivi.avwx.wx.shareText
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -98,7 +100,9 @@ private fun AirportPage(vm: AppViewModel, airport: Airport, now: Long, onBack: (
     val ctx = LocalContext.current
     LaunchedEffect(airport.icao, airport.lat) {
         vm.loadHistory(airport.icao)
-        vm.loadAloft(airport)
+        val la = airport.lat
+        val lo = airport.lon
+        if (la != null && lo != null) vm.loadAloft(airport.icao, la, lo)
     }
     val d = vm.decoded[airport.icao]
     val metar = d?.metar
@@ -159,7 +163,11 @@ private fun AirportPage(vm: AppViewModel, airport: Airport, now: Long, onBack: (
             val lon = airport.lon
             if (lat != null && lon != null) SunSection(lat, lon, now)
             val al = vm.aloft[airport.icao]
-            if (al != null) AloftSection(al, now)
+            if (al != null) {
+                StormSection(al, now)
+                AloftSection(al, now)
+            }
+            if (airport.icao.startsWith("VR")) NotamSection()
             Spacer(Modifier.height(16.dp))
         }
     }
@@ -410,6 +418,7 @@ private fun TafSection(taf: Taf, now: Long) {
         },
     ) {
         RawText(taf.raw)
+        TafBar(taf, nowInst)
         val to = taf.validTo
         if (to != null && to.isBefore(nowInst)) {
             Spacer(Modifier.height(8.dp))
@@ -605,20 +614,88 @@ private fun SunItem(label: String, t: Instant?) {
     }
 }
 
-// ---------------------------------------------------------------- winds aloft
+// ---------------------------------------------------------------- graphical TAF
+
+/** The next 24 hours of the TAF as a bar: main forecast below, worst TEMPO / PROB condition as a strip above. */
+@Composable
+private fun TafBar(taf: Taf, now: Instant) {
+    val hours = remember(taf.raw, now.epochSecond / 600) { tafHourly(taf, now, 24) }
+    if (hours.size < 2) return
+    val text = MaterialTheme.colorScheme.onSurfaceVariant
+    Spacer(Modifier.height(10.dp))
+    Canvas(Modifier.fillMaxWidth().height(34.dp)) {
+        val cell = size.width / hours.size
+        val gap = 1.dp.toPx()
+        val stripH = size.height * 0.28f
+        hours.forEachIndexed { i, hr ->
+            val x = i * cell
+            if (hr.worst != hr.prevailing || hr.thunder) {
+                drawRect(if (hr.thunder) Amber else catColor(hr.worst), topLeft = Offset(x, 0f), size = androidx.compose.ui.geometry.Size(cell - gap, stripH))
+            }
+            drawRect(catColor(hr.prevailing), topLeft = Offset(x, stripH + gap), size = androidx.compose.ui.geometry.Size(cell - gap, size.height - stripH - gap))
+        }
+    }
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        val marks = listOf(0, hours.size / 4, hours.size / 2, hours.size * 3 / 4, hours.size - 1).distinct()
+        for (m in marks) {
+            Text(Fmt.zulu(hours[m].start).take(2) + "Z", fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = text)
+        }
+    }
+    Text(
+        "Bar: main forecast by hour. Strip above: worst temporary or probable condition (amber = thunderstorm).",
+        fontSize = 11.sp, color = text,
+    )
+}
+
+// ---------------------------------------------------------------- thunderstorm risk
+
+private val TS_COLOURS = arrayOf(Color(0xFF2B3A4A), Color(0xFFFFB84D), Color(0xFFFF4D4D))
+
+@Composable
+private fun StormSection(al: Aloft, now: Long) {
+    val start = al.indexAt(now / 1000)
+    val risks = (start until minOf(start + 12, al.times.size)).map { al.thunder(it) }
+    if (risks.isEmpty()) return
+    val worst = risks.max()
+    Section("Thunderstorm risk", trailing = {
+        Text("next ${risks.size} h", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }) {
+        Text(
+            Upper.thunderWord(worst) + if (worst > 0) {
+                val first = risks.indexOfFirst { it == worst }
+                al.times.getOrNull(start + first)?.let { " from about " + Fmt.zulu(it) + " (" + Fmt.local(it) + " LT)" } ?: ""
+            } else "",
+            fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+            color = if (worst == 0) MaterialTheme.colorScheme.onSurface else TS_COLOURS[worst],
+        )
+        Spacer(Modifier.height(8.dp))
+        Canvas(Modifier.fillMaxWidth().height(16.dp)) {
+            val cell = size.width / risks.size
+            risks.forEachIndexed { i, r ->
+                drawRect(TS_COLOURS[r], topLeft = Offset(i * cell, 0f), size = androidx.compose.ui.geometry.Size(cell - 1.dp.toPx(), size.height))
+            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(al.times.getOrNull(start)?.let { Fmt.zulu(it) } ?: "", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("grey low · amber medium · red high", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(al.times.getOrNull(start + risks.size - 1)?.let { Fmt.zulu(it) } ?: "", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Model estimate from instability and forecast rain (Open-Meteo). It is not lightning detection.",
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+// ---------------------------------------------------------------- upper air
 
 @Composable
 private fun AloftSection(al: Aloft, now: Long) {
     var offsetIdx by remember { mutableIntStateOf(0) }
     val offsets = listOf(0, 3, 6, 12)
-    val want = now / 1000 + offsets[offsetIdx] * 3600L
-    var idx = 0
-    var best = Long.MAX_VALUE
-    al.times.forEachIndexed { i, t ->
-        val dlt = kotlin.math.abs(t.epochSecond - want)
-        if (dlt < best) { best = dlt; idx = i }
-    }
-    Section("Winds aloft", trailing = {
+    val idx = al.indexAt(now / 1000 + offsets[offsetIdx] * 3600L)
+    Section("Upper air", trailing = {
         Text(al.times.getOrNull(idx)?.let { "valid " + Fmt.zuluDay(it) } ?: "", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -636,27 +713,85 @@ private fun AloftSection(al: Aloft, now: Long) {
             }
         }
         Spacer(Modifier.height(10.dp))
-        for (lv in al.levels.reversed()) {
+        InfoRow("Freezing lvl", Upper.freezingLabel(al.freezingFt.getOrNull(idx)))
+        val ice = al.icingBand(idx)
+        InfoRow("Icing risk", ice ?: "None at these levels", highlight = ice != null)
+        val turb = al.turbulenceBand(idx)
+        InfoRow("Turbulence", turb ?: "None indicated", highlight = turb != null)
+        Spacer(Modifier.height(6.dp))
+        for (li in al.levels.indices.reversed()) {
+            val lv = al.levels[li]
             val spd = lv.speedKt.getOrNull(idx)
             val dir = lv.dirDeg.getOrNull(idx)
             val temp = lv.tempC.getOrNull(idx)
-            Row(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                Text(lv.label, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(96.dp))
-                Text(
-                    if (spd != null && dir != null) "%03d° / %d kt".format(Math.round(dir).toInt() % 360, Math.round(spd).toInt()) else "—",
-                    fontSize = 15.sp, fontWeight = FontWeight.Medium, fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f),
-                )
-                Text(
-                    if (temp != null) "%+d°C".format(Math.round(temp).toInt()) else "",
-                    fontSize = 15.sp, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurface,
-                )
+            val iceR = al.icing(li, idx)
+            val turbR = al.turbulence(li, idx)
+            Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                Row {
+                    Text(lv.label, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(96.dp))
+                    Text(
+                        if (spd != null && dir != null) "%03d° / %d kt".format(Math.round(dir).toInt() % 360, Math.round(spd).toInt()) else "—",
+                        fontSize = 15.sp, fontWeight = FontWeight.Medium, fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        if (temp != null) "%+d°C".format(Math.round(temp).toInt()) else "",
+                        fontSize = 15.sp, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+                if (iceR > 0 || turbR > 0) {
+                    val parts = ArrayList<String>()
+                    if (iceR > 0) parts += "Icing " + Upper.riskWord(iceR)
+                    if (turbR > 0) parts += "Turbulence " + Upper.riskWord(turbR)
+                    Text(
+                        parts.joinToString("  ·  "), fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                        color = if (iceR >= 2 || turbR >= 2) Amber else Color(0xFF7CC4F0),
+                        modifier = Modifier.padding(start = 96.dp),
+                    )
+                }
             }
         }
         Spacer(Modifier.height(6.dp))
         Text(
-            "Model forecast (Open-Meteo), not an official wind chart. Levels are approximate pressure altitudes.",
+            "Model forecast (Open-Meteo), not an official chart. Icing is estimated from temperature and humidity, " +
+                "turbulence from wind shear between levels. Convective cloud can produce both where none is shown.",
             fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+// ---------------------------------------------------------------- NOTAMs
+
+const val MACL_NOTAM_URL = "https://macl.aero/corporate/services/operational/ans"
+
+fun openUrl(ctx: android.content.Context, url: String) {
+    try {
+        ctx.startActivity(
+            android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    } catch (e: Exception) {
+        // No browser installed.
+    }
+}
+
+@Composable
+fun NotamSection() {
+    val ctx = LocalContext.current
+    Section("NOTAMs") {
+        Text(
+            "Open official NOTAMs (MACL)", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF06131B),
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.primary)
+                .clickable { openUrl(ctx, MACL_NOTAM_URL) }
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Opens the Maldives Airports Company air navigation page in your browser, where the current NOTAMs are published. " +
+                "NOTAMs are not shown or decoded inside this app.",
+            fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
