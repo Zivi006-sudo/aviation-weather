@@ -22,6 +22,19 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.clickable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
+import com.zivi.avwx.data.Aloft
+import com.zivi.avwx.wx.Sun
+import com.zivi.avwx.wx.shareText
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -68,8 +81,25 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
+/** Airport pages side by side: swipe left or right to move through your list. */
 @Composable
-fun AirportDetailScreen(vm: AppViewModel, airport: Airport, now: Long, onBack: () -> Unit) {
+fun AirportDetailScreen(vm: AppViewModel, startIcao: String, now: Long, onBack: () -> Unit) {
+    val list = vm.airports
+    val start = remember { list.indexOfFirst { it.icao == startIcao }.coerceAtLeast(0) }
+    val pager = rememberPagerState(initialPage = start) { list.size }
+    HorizontalPager(state = pager, modifier = Modifier.fillMaxSize()) { page ->
+        val a = list.getOrNull(page)
+        if (a != null) AirportPage(vm, a, now, onBack)
+    }
+}
+
+@Composable
+private fun AirportPage(vm: AppViewModel, airport: Airport, now: Long, onBack: () -> Unit) {
+    val ctx = LocalContext.current
+    LaunchedEffect(airport.icao, airport.lat) {
+        vm.loadHistory(airport.icao)
+        vm.loadAloft(airport)
+    }
     val d = vm.decoded[airport.icao]
     val metar = d?.metar
     val taf = d?.taf
@@ -91,6 +121,9 @@ fun AirportDetailScreen(vm: AppViewModel, airport: Airport, now: Long, onBack: (
                 }
             }
             CatPill(metar?.category ?: FlightCat.UNKNOWN)
+            IconButton(onClick = { shareOut(ctx, shareText(airport.icao, airport.name, metar, taf)) }) {
+                Icon(Icons.Filled.Share, contentDescription = "Share")
+            }
             IconButton(onClick = { confirmRemove = true }) {
                 Icon(Icons.Filled.Delete, contentDescription = "Remove airport")
             }
@@ -120,6 +153,13 @@ fun AirportDetailScreen(vm: AppViewModel, airport: Airport, now: Long, onBack: (
                     Text("No TAF published for this airport.", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
+            val hist = vm.history[airport.icao]
+            if (hist != null && hist.size >= 3) TrendSection(hist)
+            val lat = airport.lat
+            val lon = airport.lon
+            if (lat != null && lon != null) SunSection(lat, lon, now)
+            val al = vm.aloft[airport.icao]
+            if (al != null) AloftSection(al, now)
             Spacer(Modifier.height(16.dp))
         }
     }
@@ -460,4 +500,163 @@ private fun changedParts(g: TafGroup): String {
     if (c.nsw) parts += "weather clearing"
     if (c.clouds.isNotEmpty()) parts += describeClouds(c).lowercase()
     return parts.joinToString("; ").replaceFirstChar { it.uppercase() }
+}
+
+// ---------------------------------------------------------------- trends
+
+@Composable
+private fun TrendSection(hist: List<Metar>) {
+    val pts = hist.filter { it.obsTime != null }
+    if (pts.size < 2) return
+    val t0 = pts.first().obsTime!!.epochSecond
+    val t1 = pts.last().obsTime!!.epochSecond
+    val hours = ((t1 - t0) / 3600.0)
+    Section("Trend", trailing = {
+        Text("last %.0f h · %d reports".format(hours, pts.size), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }) {
+        val wind = pts.mapNotNull { m -> m.cond.wind?.let { m.obsTime!!.epochSecond to it.speedKt.toFloat() } }
+        val gust = pts.mapNotNull { m -> m.cond.wind?.gustKt?.let { m.obsTime!!.epochSecond to it.toFloat() } }
+        val vis = pts.mapNotNull { m -> m.cond.visM?.let { m.obsTime!!.epochSecond to (it.coerceAtMost(10000) / 1000f) } }
+        val qnh = pts.mapNotNull { m -> m.qnhHpa?.let { m.obsTime!!.epochSecond to it.toFloat() } }
+        val latest = pts.last()
+        if (wind.size >= 2) {
+            TrendRow("Wind", shortWind(latest.cond.wind), wind, gust, t0, t1, floor = 0f, minSpan = 10f, unit = "kt")
+        }
+        if (vis.size >= 2) {
+            Spacer(Modifier.height(12.dp))
+            TrendRow("Visibility", shortVis(latest.cond), vis, emptyList(), t0, t1, floor = 0f, minSpan = 10f, unit = "km", fixedTop = 10f)
+        }
+        if (qnh.size >= 2) {
+            Spacer(Modifier.height(12.dp))
+            TrendRow("QNH", (latest.qnhHpa?.toString() ?: "—") + " hPa", qnh, emptyList(), t0, t1, floor = null, minSpan = 4f, unit = "")
+        }
+    }
+}
+
+@Composable
+private fun TrendRow(
+    label: String, value: String,
+    line: List<Pair<Long, Float>>, dots: List<Pair<Long, Float>>,
+    t0: Long, t1: Long, floor: Float?, minSpan: Float, unit: String, fixedTop: Float? = null,
+) {
+    val colour = MaterialTheme.colorScheme.primary
+    val grid = MaterialTheme.colorScheme.outlineVariant
+    val all = line.map { it.second } + dots.map { it.second }
+    var lo = floor ?: all.min()
+    var hi = fixedTop ?: all.max()
+    if (hi - lo < minSpan) {
+        if (floor != null) hi = lo + minSpan else { val mid = (hi + lo) / 2; lo = mid - minSpan / 2; hi = mid + minSpan / 2 }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.width(96.dp)) {
+            Text(label, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(value, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+        }
+        Canvas(Modifier.weight(1f).height(52.dp)) {
+            val span = (t1 - t0).coerceAtLeast(1).toFloat()
+            fun x(t: Long) = (t - t0) / span * size.width
+            fun y(v: Float) = size.height - (v - lo) / (hi - lo) * size.height
+            drawLine(grid, Offset(0f, 0f), Offset(size.width, 0f), strokeWidth = 1f)
+            drawLine(grid, Offset(0f, size.height), Offset(size.width, size.height), strokeWidth = 1f)
+            val path = Path()
+            line.forEachIndexed { i, p ->
+                if (i == 0) path.moveTo(x(p.first), y(p.second)) else path.lineTo(x(p.first), y(p.second))
+            }
+            drawPath(path, colour, style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round))
+            for (p in dots) drawCircle(Amber, radius = 3.dp.toPx(), center = Offset(x(p.first), y(p.second)))
+            val lastPt = line.last()
+            drawCircle(colour, radius = 3.5.dp.toPx(), center = Offset(x(lastPt.first), y(lastPt.second)))
+        }
+        Column(Modifier.width(44.dp).height(52.dp).padding(start = 6.dp), verticalArrangement = Arrangement.SpaceBetween) {
+            Text(axisLabel(hi, unit), fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(axisLabel(lo, unit), fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+private fun axisLabel(v: Float, unit: String): String = "%.0f".format(v) + if (unit.isEmpty()) "" else " $unit"
+
+// ---------------------------------------------------------------- sun
+
+@Composable
+private fun SunSection(lat: Double, lon: Double, now: Long) {
+    val sun = remember(lat, lon, now / 3_600_000L) { Sun.times(lat, lon, Instant.ofEpochMilli(now)) }
+    Section("Daylight") {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            SunItem("First light", sun.civilDawn)
+            SunItem("Sunrise", sun.sunrise)
+            SunItem("Sunset", sun.sunset)
+            SunItem("Last light", sun.civilDusk)
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Local time, with UTC below. First and last light are civil twilight.",
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun SunItem(label: String, t: Instant?) {
+    Column {
+        Text(label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(t?.let { Fmt.local(it) } ?: "—", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+        Text(t?.let { Fmt.zulu(it) } ?: "", fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+// ---------------------------------------------------------------- winds aloft
+
+@Composable
+private fun AloftSection(al: Aloft, now: Long) {
+    var offsetIdx by remember { mutableIntStateOf(0) }
+    val offsets = listOf(0, 3, 6, 12)
+    val want = now / 1000 + offsets[offsetIdx] * 3600L
+    var idx = 0
+    var best = Long.MAX_VALUE
+    al.times.forEachIndexed { i, t ->
+        val dlt = kotlin.math.abs(t.epochSecond - want)
+        if (dlt < best) { best = dlt; idx = i }
+    }
+    Section("Winds aloft", trailing = {
+        Text(al.times.getOrNull(idx)?.let { "valid " + Fmt.zuluDay(it) } ?: "", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            offsets.forEachIndexed { i, hrs ->
+                val on = i == offsetIdx
+                Text(
+                    if (hrs == 0) "Now" else "+$hrs h", fontSize = 13.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.Medium,
+                    color = if (on) Color(0xFF06131B) else MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (on) MaterialTheme.colorScheme.primary else Color(0xFF0B1016))
+                        .clickable { offsetIdx = i }
+                        .padding(horizontal = 12.dp, vertical = 7.dp),
+                )
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+        for (lv in al.levels.reversed()) {
+            val spd = lv.speedKt.getOrNull(idx)
+            val dir = lv.dirDeg.getOrNull(idx)
+            val temp = lv.tempC.getOrNull(idx)
+            Row(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                Text(lv.label, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(96.dp))
+                Text(
+                    if (spd != null && dir != null) "%03d° / %d kt".format(Math.round(dir).toInt() % 360, Math.round(spd).toInt()) else "—",
+                    fontSize = 15.sp, fontWeight = FontWeight.Medium, fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f),
+                )
+                Text(
+                    if (temp != null) "%+d°C".format(Math.round(temp).toInt()) else "",
+                    fontSize = 15.sp, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Model forecast (Open-Meteo), not an official wind chart. Levels are approximate pressure altitudes.",
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }

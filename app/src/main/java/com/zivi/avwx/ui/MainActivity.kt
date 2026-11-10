@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -95,6 +96,12 @@ fun AppRoot(vm: AppViewModel) {
                 NavigationBarItem(
                     selected = tab == 2,
                     onClick = { tab = 2 },
+                    icon = { Icon(Icons.Filled.Send, contentDescription = null) },
+                    label = { Text("Sector") },
+                )
+                NavigationBarItem(
+                    selected = tab == 3,
+                    onClick = { tab = 3 },
                     icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
                     label = { Text("Settings") },
                 )
@@ -105,14 +112,14 @@ fun AppRoot(vm: AppViewModel) {
             when (tab) {
                 0 -> {
                     val icao = detail
-                    val airport = vm.airports.firstOrNull { it.icao == icao }
-                    if (airport != null) {
-                        AirportDetailScreen(vm, airport, now, onBack = { detail = null })
+                    if (icao != null && vm.airports.any { it.icao == icao }) {
+                        AirportDetailScreen(vm, icao, now, onBack = { detail = null })
                     } else {
                         AirportsScreen(vm, now, onOpen = { detail = it })
                     }
                 }
                 1 -> MapScreen(vm, now)
+                2 -> SectorScreen(vm, now)
                 else -> SettingsScreen(vm)
             }
         }

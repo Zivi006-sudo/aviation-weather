@@ -20,6 +20,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material3.pulltorefresh.PullToRefreshContainer
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -68,6 +77,17 @@ fun ScreenHeader(title: String, subtitle: String?, actions: @Composable () -> Un
 @Composable
 fun AirportsScreen(vm: AppViewModel, now: Long, onOpen: (String) -> Unit) {
     var adding by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf(false) }
+    val pull = rememberPullToRefreshState()
+    if (pull.isRefreshing) {
+        LaunchedEffect(true) {
+            vm.refresh()
+            if (!vm.refreshing) pull.endRefresh()
+        }
+    }
+    LaunchedEffect(vm.refreshing) {
+        if (!vm.refreshing) pull.endRefresh()
+    }
 
     val subtitle = when {
         vm.wxError != null -> vm.wxError
@@ -78,6 +98,12 @@ fun AirportsScreen(vm: AppViewModel, now: Long, onOpen: (String) -> Unit) {
 
     Column(Modifier.fillMaxSize()) {
         ScreenHeader("Airports", subtitle) {
+            IconButton(onClick = { editing = !editing }) {
+                Icon(
+                    Icons.Filled.Edit, contentDescription = "Reorder airports",
+                    tint = if (editing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             IconButton(onClick = { adding = true }) {
                 Icon(Icons.Filled.Add, contentDescription = "Add airport")
             }
@@ -98,27 +124,45 @@ fun AirportsScreen(vm: AppViewModel, now: Long, onOpen: (String) -> Unit) {
                 )
             }
         } else {
-            LazyColumn(
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                items(vm.airports, key = { it.icao }) { a ->
-                    AirportCard(a, vm.decoded[a.icao], now, onClick = { onOpen(a.icao) })
+            Box(Modifier.fillMaxSize().nestedScroll(pull.nestedScrollConnection)) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 24.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    items(vm.airports, key = { it.icao }) { a ->
+                        if (editing) {
+                            ReorderRow(
+                                a,
+                                onUp = { vm.moveAirport(a.icao, -1) },
+                                onDown = { vm.moveAirport(a.icao, 1) },
+                            )
+                        } else {
+                            AirportCard(a, vm.decoded[a.icao], now, onClick = { onOpen(a.icao) })
+                        }
+                    }
+                    item {
+                        Text(
+                            if (editing) "Use the arrows to reorder. The first airport is the one shown on the home screen widget."
+                            else "Flight categories use the US definitions (ceiling and visibility). For situational awareness only.",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
+                        )
+                    }
                 }
-                item {
-                    Text(
-                        "Flight categories use the US definitions (ceiling and visibility). For situational awareness only.",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
-                    )
-                }
+                val grow = if (pull.isRefreshing) 1f else pull.progress.coerceIn(0f, 1f)
+                PullToRefreshContainer(
+                    state = pull,
+                    modifier = Modifier.align(Alignment.TopCenter).graphicsLayer(scaleX = grow, scaleY = grow),
+                )
             }
         }
     }
 
     if (adding) {
         AddAirportDialog(
+            recents = vm.recents,
             onDismiss = { adding = false },
             onAdd = { code ->
                 val err = vm.addAirport(code)
@@ -205,7 +249,7 @@ private fun Stat(label: String, value: String) {
 }
 
 @Composable
-private fun AddAirportDialog(onDismiss: () -> Unit, onAdd: (String) -> String?) {
+private fun AddAirportDialog(recents: List<String>, onDismiss: () -> Unit, onAdd: (String) -> String?) {
     var text by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     AlertDialog(
@@ -221,6 +265,22 @@ private fun AddAirportDialog(onDismiss: () -> Unit, onAdd: (String) -> String?) 
                     isError = error != null,
                     keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
                 )
+                if (recents.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Text("Recently removed", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
+                        for (r in recents.take(4)) {
+                            Text(
+                                r, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { error = onAdd(r) }
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                            )
+                        }
+                    }
+                }
                 val msg = error
                 if (msg != null) {
                     Spacer(Modifier.height(8.dp))
@@ -231,4 +291,21 @@ private fun AddAirportDialog(onDismiss: () -> Unit, onAdd: (String) -> String?) 
         confirmButton = { TextButton(onClick = { error = onAdd(text) }) { Text("Add") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+@Composable
+private fun ReorderRow(a: Airport, onUp: () -> Unit, onDown: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().background(CardColor, RoundedCornerShape(18.dp)).padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(a.icao, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+            if (a.name.isNotBlank() && a.name != a.icao) {
+                Text(a.name, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        IconButton(onClick = onUp) { Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "Move up", tint = Color.White) }
+        IconButton(onClick = onDown) { Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Move down", tint = Color.White) }
+    }
 }
