@@ -46,6 +46,11 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        vm.markOpened()
+    }
 }
 
 @Composable

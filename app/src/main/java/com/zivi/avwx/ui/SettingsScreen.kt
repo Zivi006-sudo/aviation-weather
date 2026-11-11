@@ -126,6 +126,21 @@ fun SettingsScreen(vm: AppViewModel) {
                 ) { vm.updateShowLightRain(it) }
             }
 
+            Section("Background download") {
+                SwitchRow(
+                    "Download Maldives weather ahead",
+                    "Keeps cloud, rain and tops (every 15 min) and wind and icing (every 3 h) for the Maldives ready on the phone, " +
+                        "while the app is open or in the background. Pauses after 6 hours without opening the app.",
+                    vm.prefetchOn,
+                ) { vm.updatePrefetchOn(it) }
+                Spacer(Modifier.height(10.dp))
+                SwitchRow(
+                    "Wi-Fi only",
+                    "Off: also uses mobile data, roughly 3–6 MB an hour while active.",
+                    vm.prefetchWifiOnly,
+                ) { vm.updatePrefetchWifiOnly(it) }
+            }
+
             Section("Storage") {
                 LaunchedEffect(Unit) { vm.refreshCacheSize() }
                 Text(

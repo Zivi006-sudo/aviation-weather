@@ -11,8 +11,8 @@ android {
         applicationId = "com.zivi.avwx"
         minSdk = 26
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.9"
+        versionCode = 10
+        versionName = "1.0"
     }
 
     // A fixed key kept in the repo, so every build from GitHub installs over the previous one.

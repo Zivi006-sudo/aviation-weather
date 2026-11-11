@@ -177,6 +177,23 @@ class Store(ctx: Context) {
         get() = prefs.getBoolean("enhanced", true)
         set(v) = prefs.edit().putBoolean("enhanced", v).apply()
 
+    /** Download the Maldives pictures and forecasts in the background. */
+    var prefetchOn: Boolean
+        get() = prefs.getBoolean("prefetch", true)
+        set(v) = prefs.edit().putBoolean("prefetch", v).apply()
+
+    var prefetchWifiOnly: Boolean
+        get() = prefs.getBoolean("prefetchWifi", false)
+        set(v) = prefs.edit().putBoolean("prefetchWifi", v).apply()
+
+    var lastOpened: Long
+        get() = prefs.getLong("lastOpened", 0L)
+        set(v) = prefs.edit().putLong("lastOpened", v).apply()
+
+    var lastGridPrefetch: Long
+        get() = prefs.getLong("lastGridPrefetch", 0L)
+        set(v) = prefs.edit().putLong("lastGridPrefetch", v).apply()
+
     /** Extra satellite layer: "none", "rain" or "cth". */
     var overlay: String
         get() = prefs.getString("overlay", "none") ?: "none"
@@ -415,7 +432,7 @@ class Aloft(
 }
 
 enum class GridKind(val cols: Int, val rows: Int) {
-    WIND(14, 20),     // wind at every level
+    WIND(16, 22),     // wind at every level
     ICING(10, 12),    // temperature and humidity at the upper levels
 }
 
@@ -628,9 +645,9 @@ object ExtraApi {
 
     /**
      * Forecast grid for an area, for every map level at once, so changing level or time needs no new download.
-     * A copy is kept on the phone for an hour.
+     * A copy is kept on the phone and used while younger than [maxAgeMin] minutes.
      */
-    suspend fun grid(ctx: Context, kind: GridKind, west: Double, south: Double, east: Double, north: Double, key: String): FcGrid =
+    suspend fun grid(ctx: Context, kind: GridKind, west: Double, south: Double, east: Double, north: Double, key: String, maxAgeMin: Int = 120): FcGrid =
         withContext(Dispatchers.IO) {
             val cols = kind.cols
             val rows = kind.rows
@@ -658,7 +675,7 @@ object ExtraApi {
             val dir = File(ctx.cacheDir, "grid").apply { mkdirs() }
             val file = File(dir, "${kind.name}_$key.json")
             var fetchedAt = file.lastModified()
-            val text = if (file.exists() && file.length() > 1000 && System.currentTimeMillis() - fetchedAt < 60 * 60_000L) {
+            val text = if (file.exists() && file.length() > 1000 && System.currentTimeMillis() - fetchedAt < maxAgeMin * 60_000L) {
                 file.readText()
             } else {
                 OmBudget.take((n * maxOf(1.0, vars.size / 10.0)).toInt())
@@ -666,7 +683,7 @@ object ExtraApi {
                     "&wind_speed_unit=kn&forecast_days=3&timeformat=unixtime&timezone=GMT"
                 val t = Net.getText(url, maxBytes = 14_000_000).trim()
                 if (!t.startsWith("[")) throw java.io.IOException("forecast grid refused")
-                dir.listFiles()?.forEach { f -> if (System.currentTimeMillis() - f.lastModified() > 3 * 3600_000L) f.delete() }
+                dir.listFiles()?.forEach { f -> if (System.currentTimeMillis() - f.lastModified() > 4 * 3600_000L) f.delete() }
                 file.writeText(t)
                 fetchedAt = System.currentTimeMillis()
                 t
@@ -792,6 +809,10 @@ object Sat {
     )
 
     private const val WMS = "https://view.eumetsat.int/geoserver/wms"
+    /** EUMETSAT's ready-made tile store: much quicker when a tile has already been drawn for someone else. */
+    private const val GWC = "https://view.eumetsat.int/geoserver/gwc/service/wms"
+    @Volatile private var gwcFails = 0
+    private val gwcOn: Boolean get() = gwcFails < 6
     private val ISO_RE = Regex("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z")
     private val NAME_RE = Regex("<Name>([^<]+)</Name>")
 
@@ -908,9 +929,9 @@ object Sat {
         return (n downTo 0).map { latest.minusSeconds(it * STEP_MIN * 60) }
     }
 
-    private fun wmsTileUrl(layerEnc: String, format: String, time: Instant, transparent: Boolean, z: Int, x: Int, y: Int): String {
+    private fun wmsTileUrl(layerEnc: String, format: String, time: Instant, transparent: Boolean, z: Int, x: Int, y: Int, gwc: Boolean = false): String {
         val n = (1 shl z).toDouble()
-        val sb = StringBuilder(WMS)
+        val sb = StringBuilder(if (gwc) GWC else WMS)
         sb.append("?service=WMS&version=1.1.1&request=GetMap&layers=").append(layerEnc)
         sb.append("&styles=&format=").append(format)
         sb.append("&srs=EPSG%3A3857&bbox=")
@@ -919,6 +940,7 @@ object Sat {
         sb.append("&width=256&height=256")
         if (transparent) sb.append("&transparent=true")
         sb.append("&time=").append(time.toString().replace(":", "%3A"))
+        if (gwc) sb.append("&tiled=true")
         return sb.toString()
     }
 
@@ -949,7 +971,17 @@ object Sat {
     }
 
     /** Greyscale infrared tile from a EUMETSAT satellite, from the phone if already downloaded. */
-    suspend fun loadIrTile(ctx: Context, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
+    fun hasIrTile(ctx: Context, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Boolean =
+        File(cacheDir(ctx), "ir${src.id}_${time.epochSecond}_${z}_${x}_$y").let { it.exists() && it.length() > 300 }
+
+    fun hasOverlayTile(ctx: Context, o: Overlay, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Boolean =
+        File(cacheDir(ctx), "${o.key}${src.id}_${time.epochSecond}_${z}_${x}_$y").let { it.exists() && it.length() > 60 }
+
+    /**
+     * Greyscale infrared tile from a EUMETSAT satellite, from the phone if already downloaded.
+     * With [preferCache] the ready-made tile store is tried first, then the normal service.
+     */
+    suspend fun loadIrTile(ctx: Context, src: SatSource, time: Instant, z: Int, x: Int, y: Int, preferCache: Boolean = false): Bitmap? = withContext(Dispatchers.IO) {
         val name = "ir${src.id}_${time.epochSecond}_${z}_${x}_$y"
         if (noData.containsKey(name)) return@withContext null
         val f = File(cacheDir(ctx), name)
@@ -964,8 +996,25 @@ object Sat {
             val tryList = if (known != null) listOf(known) else src.irLayers.indices.toList()
             var answered = false
             for (i in tryList) {
+                val layer = src.irLayers[i].replace(":", "%3A")
+                if (preferCache && gwcOn) {
+                    val quick = try {
+                        Net.getBytes(wmsTileUrl(layer, "image%2Fjpeg", time, false, z, x, y, gwc = true), maxBytes = 2_000_000)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    val qb = quick?.let { BitmapFactory.decodeByteArray(it, 0, it.size, opts) }
+                    if (qb != null && !isFlat(qb)) {
+                        gwcFails = 0
+                        irLayerIdx[src.id] = i
+                        f.writeBytes(quick)
+                        return@withContext qb
+                    }
+                    qb?.recycle()
+                    gwcFails++
+                }
                 val bytes = try {
-                    Net.getBytes(wmsTileUrl(src.irLayers[i].replace(":", "%3A"), "image%2Fjpeg", time, false, z, x, y), maxBytes = 2_000_000)
+                    Net.getBytes(wmsTileUrl(layer, "image%2Fjpeg", time, false, z, x, y), maxBytes = 2_000_000)
                 } catch (e: Exception) {
                     continue
                 }

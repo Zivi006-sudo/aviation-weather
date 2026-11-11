@@ -115,7 +115,7 @@ fun RadarScreen(vm: AppViewModel, now: Long) {
     }
 
     // Cloud overlay: the newest satellite picture, loaded as tiles for this view.
-    val cloudR by remember(cam) { derivedStateOf { satRange(cam, 1) } }
+    val cloudR by remember(cam) { derivedStateOf { satView(cam) } }
     LaunchedEffect(cam, showCloud) {
         if (!showCloud) return@LaunchedEffect
         snapshotFlow { cloudR }.collectLatest { r ->
@@ -125,7 +125,7 @@ fun RadarScreen(vm: AppViewModel, now: Long) {
             }
         }
     }
-    val cloudPlan = remember { SatPlan(0) }
+    val cloudPlan = remember { SatPlan() }
     val cloudTimes = vm.satTimes
 
     TileLoader(TileSource.SAT, cam)
@@ -182,7 +182,7 @@ fun RadarScreen(vm: AppViewModel, now: Long) {
                 drawTiles(TileSource.SAT, cam)
 
                 if (showCloud && cloudTimes.isNotEmpty()) {
-                    drawSat(cloudPlan, cam, cloudR, cloudTimes, (cloudTimes.size - 1).toFloat(), 0.8f, fade = false)
+                    drawSat(cloudPlan, cam, cloudR, cloudTimes, SatMem.GREY, (cloudTimes.size - 1).toFloat(), 0.8f, fade = false)
                 }
 
                 // ---- airports (all Maldivian ones, yours in colour), then English place names around them
