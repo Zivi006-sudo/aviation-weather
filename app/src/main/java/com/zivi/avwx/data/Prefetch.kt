@@ -73,15 +73,15 @@ object Prefetch {
         val list = tiles()
 
         // Cloud: newest picture first.
-        val jobs = ArrayList<kotlinx.coroutines.Deferred<Unit>>()
+        val jobs = ArrayList<kotlinx.coroutines.Deferred<*>>()
         for (f in frames.reversed()) for (t in list) {
             val src = Sat.sourceFor(t.z, t.x)
             if (src.gibs != null || Sat.hasIrTile(ctx, src, f, t.z, t.x, t.y)) continue
-            jobs += async {
+            jobs.add(async {
                 gate.withPermit {
                     Sat.loadIrTile(ctx, src, f, t.z, t.x, t.y, preferCache = f == latest)?.recycle()
                 }
-            }
+            })
         }
         jobs.awaitAll()
 
@@ -91,7 +91,7 @@ object Prefetch {
             if (!Sat.isResolved(o)) continue
             val top = Sat.checkOverlayLatest(o) ?: Sat.overlayLatest(o) ?: continue
             val times = frames.map { if (it.isAfter(top)) top else it }.distinct()
-            val oj = ArrayList<kotlinx.coroutines.Deferred<Unit>>()
+            val oj = ArrayList<kotlinx.coroutines.Deferred<*>>()
             for (f in times.reversed()) for (t in list) {
                 val src = Sat.sourceFor(t.z, t.x)
                 if (src.gibs != null) continue
@@ -102,7 +102,7 @@ object Prefetch {
                 // Tops are trimmed with the infrared picture of the same time.
                 val needIr = o == Overlay.TOPS && !Sat.hasIrTile(ctx, src, f, t.z, t.x, t.y)
                 if (!needOv && !needIr) continue
-                oj += async {
+                oj.add(async {
                     gate.withPermit {
                         if (needOv) {
                             val b = Sat.loadOverlayTile(ctx, o, src, f, t.z, t.x, t.y)
@@ -111,7 +111,7 @@ object Prefetch {
                         }
                         if (needIr) Sat.loadIrTile(ctx, src, f, t.z, t.x, t.y)?.recycle()
                     }
-                }
+                })
             }
             oj.awaitAll()
         }
