@@ -10,8 +10,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.LocationOn
-import androidx.compose.material.icons.filled.Place
+import androidx.compose.ui.res.painterResource
+import com.zivi.avwx.R
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
@@ -91,13 +91,13 @@ fun AppRoot(vm: AppViewModel) {
                 NavigationBarItem(
                     selected = tab == 1,
                     onClick = { tab = 1 },
-                    icon = { Icon(Icons.Filled.Place, contentDescription = null) },
+                    icon = { Icon(painterResource(R.drawable.ic_tab_sat), contentDescription = null) },
                     label = { Text("Satellite") },
                 )
                 NavigationBarItem(
                     selected = tab == 2,
                     onClick = { tab = 2 },
-                    icon = { Icon(Icons.Filled.LocationOn, contentDescription = null) },
+                    icon = { Icon(painterResource(R.drawable.ic_tab_radar), contentDescription = null) },
                     label = { Text("Radar") },
                 )
                 NavigationBarItem(

@@ -34,6 +34,10 @@ object Merc {
     fun lon(x: Double): Double = x * 360.0 - 180.0
     fun lat(y: Double): Double = atan(sinh(PI * (1.0 - 2.0 * y))) * 180.0 / PI
 
+    /** World units (0..1) to EPSG:3857 metres. */
+    fun mx(worldX: Double): Double = (worldX - 0.5) * 2.0 * R
+    fun my(worldY: Double): Double = (0.5 - worldY) * 2.0 * R
+
     /** EPSG:3857 metres. */
     fun metresX(lon: Double): Double = lon * R / 180.0
     fun metresY(lat: Double): Double = (0.5 - y(lat)) * 2.0 * R

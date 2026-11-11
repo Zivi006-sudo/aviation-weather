@@ -17,7 +17,14 @@ object Upper {
         return if (ft < 10000) "%,d ft".format(ft) else "FL%03d".format(ft / 100)
     }
 
-    /** 0 none, 1 light, 2 moderate, 3 high. Icing needs sub-zero temperature and moist air. */
+    /** Levels of the map forecast layers. The first is the surface (10 m wind); null means no pressure level. */
+    val GRID_HPA = arrayOf<Int?>(null, 925, 850, 700, 600, 500, 400)
+    val GRID_LABELS = arrayOf("Surface", "2,500 ft", "5,000 ft", "FL100", "FL140", "FL180", "FL240")
+
+    /** Cloud-top colour for a height in feet, counted from the lowest height shown ([fromFt]) up to 50,000 ft. */
+    val TOPS_SCALE = intArrayOf(0xF4E04D, 0xF28C28, 0xE0302B, 0xC21FB5, 0xF7F0FF)
+
+        /** 0 none, 1 light, 2 moderate, 3 high. Icing needs sub-zero temperature and moist air. */
     fun icing(tempC: Double?, rh: Double?): Int {
         if (tempC == null || rh == null) return 0
         if (tempC > 0.0 || tempC < -20.0) return 0

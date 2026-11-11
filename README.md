@@ -10,8 +10,11 @@ A personal Android app that puts METAR, TAF, satellite imagery and flight-planni
   add any airport by ICAO code, swipe between airports.
 - **Airport page** – runway headwind / crosswind with diagram, TAF periods with the current one highlighted,
   12-hour trend graphs (wind, visibility, QNH), first light / sunrise / sunset / last light, winds and temperatures aloft, share.
-- **Satellite map** – drawn base map with EUMETSAT infrared cloud laid over it, colour scale for cold cloud tops,
-  rain-rate layer, SIGMET areas, 1 / 2 / 3 hour timeline with play, speed and scrubbing. The satellite follows the map as you pan and zoom.
+- **Satellite map** – drawn base map with EUMETSAT infrared cloud laid over it in tiles, so parts already loaded
+  stay on screen when you zoom or pan. Colour scale for cloud-top cold, rain-rate layer, cloud tops above a chosen
+  flight level, SIGMET areas, and a 1 / 2 / 3 hour timeline with play, speed and scrubbing.
+- **Wind** – animated wind lines over a speed colour wash, from the surface to FL240, up to 48 hours ahead;
+  tap the map for the wind at a point. Icing risk as a second forecast layer.
 - **Sector** – departure, destination and alternate with ETD / ETA: forecast around each time, change groups,
   thunderstorm flags, a check against your own minima, and day or night at that time.
 - **Upper air** – freezing level, icing and turbulence risk by level, thunderstorm risk for the next 12 hours,

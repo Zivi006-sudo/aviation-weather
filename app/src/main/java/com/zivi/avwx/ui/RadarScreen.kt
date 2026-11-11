@@ -21,6 +21,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -33,18 +34,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -115,24 +112,25 @@ fun RadarScreen(vm: AppViewModel, now: Long) {
         }
     }
 
-    // Cloud overlay: make sure the satellite loop covers this view once the map settles.
+    // Cloud overlay: the newest satellite picture, loaded as tiles for this view.
+    val cloudR by remember(cam) { derivedStateOf { satRange(cam, 1) } }
     LaunchedEffect(cam, showCloud) {
         if (!showCloud) return@LaunchedEffect
-        snapshotFlow { listOf(cam.cx, cam.cy, cam.scale, cam.size.width.toDouble(), cam.size.height.toDouble()) }.collectLatest { v ->
-            if (v[2] > 0.0 && v[3] > 0.0) {
-                delay(500)
-                vm.requestSatForView(v[0], v[1], v[2], v[3].toInt(), v[4].toInt())
+        snapshotFlow { cloudR }.collectLatest { r ->
+            if (r != null) {
+                delay(150)
+                vm.satWant(r, loop = false)
             }
         }
     }
+    val cloudPlan = remember { SatPlan(0) }
+    val cloudTimes = vm.satTimes
 
     TileLoader(TileSource.SAT, cam)
 
     val aircraft = vm.aircraft
     val airports = vm.airports
     val decoded = vm.decoded
-    val cloud = if (showCloud) vm.frames.lastOrNull() else null
-    val cloudImg = remember(cloud) { cloud?.bitmap?.asImageBitmap() }
     val labelPaint = remember {
         Paint().apply {
             isAntiAlias = true
@@ -172,17 +170,8 @@ fun RadarScreen(vm: AppViewModel, now: Long) {
 
                 drawTiles(TileSource.SAT, cam)
 
-                if (cloud != null && cloudImg != null) {
-                    val bnd = cloud.bounds
-                    val l = px(w, ox, s, Merc.x(bnd.west)).roundToInt()
-                    val t = px(h, oy, s, Merc.y(bnd.north)).roundToInt()
-                    val r = px(w, ox, s, Merc.x(bnd.east)).roundToInt()
-                    val b = px(h, oy, s, Merc.y(bnd.south)).roundToInt()
-                    drawImage(
-                        cloudImg, IntOffset.Zero, IntSize(cloudImg.width, cloudImg.height),
-                        IntOffset(l, t), IntSize((r - l).coerceAtLeast(1), (b - t).coerceAtLeast(1)),
-                        alpha = 0.8f, filterQuality = FilterQuality.Low,
-                    )
+                if (showCloud && cloudTimes.isNotEmpty()) {
+                    drawSat(cloudPlan, cam, cloudR, cloudTimes, (cloudTimes.size - 1).toFloat(), 0.8f, fade = false)
                 }
 
                 // ---- airports

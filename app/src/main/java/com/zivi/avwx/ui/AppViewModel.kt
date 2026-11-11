@@ -11,19 +11,19 @@ import com.zivi.avwx.data.Aloft
 import android.graphics.Bitmap
 import com.zivi.avwx.data.ExtraApi
 import com.zivi.avwx.data.Overlay
-import com.zivi.avwx.data.WxGrid
+import com.zivi.avwx.data.FcGrid
+import com.zivi.avwx.data.GridKind
+import com.zivi.avwx.wx.Upper
+import androidx.compose.ui.graphics.asImageBitmap
 import com.zivi.avwx.data.WxMerge
 import com.zivi.avwx.data.MvMet
 import com.zivi.avwx.data.Aircraft
 import com.zivi.avwx.data.Tiles
 import com.zivi.avwx.wx.pickReports
-import com.zivi.avwx.wx.GeoBounds
 import com.zivi.avwx.wx.Merc
 import com.zivi.avwx.wx.snapBox
 import kotlinx.coroutines.delay
 import com.zivi.avwx.data.Sat
-import com.zivi.avwx.data.SatFrame
-import com.zivi.avwx.data.SatRequest
 import com.zivi.avwx.data.Sigmet
 import com.zivi.avwx.data.StationWx
 import com.zivi.avwx.data.Store
@@ -316,9 +316,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun updateDestMinima(m: Minima) { destMinima = m; store.destMinima = m }
     fun updateAltnMinima(m: Minima) { altnMinima = m; store.altnMinima = m }
 
-    // ------------------------------------------------------------ satellite
+    // ------------------------------------------------------------ satellite (tiles)
 
-    var frames by mutableStateOf<List<SatFrame>>(emptyList())
+    /** Times of the loop frames, oldest first. */
+    var satTimes by mutableStateOf<List<Instant>>(emptyList())
         private set
     var satLoading by mutableStateOf(false)
         private set
@@ -342,139 +343,144 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var sensitivity by mutableStateOf(store.sensitivity)
         private set
-
-    private var satJob: Job? = null
-    private var framesTag = ""
-    private var legendFor: Overlay? = null
-    var satRequest: SatRequest? = null
+    var topsFl by mutableStateOf(store.topsFl.coerceIn(150, 400))
         private set
 
-    fun updateEnhanced(v: Boolean) { if (v != enhanced) { enhanced = v; store.enhanced = v; reloadSat() } }
+    private var satJob: Job? = null
+    private var satWanted: TileRange? = null
+    private var satLoop = true
+    private var styleGen = 0
+    private var topsTable: ByteArray? = null
+
+    /** How many loop frames the current setting gives. */
+    val loopFrames: Int get() = loopHours * 4 + 1
+
+    /** Colours or layers changed: tiles in memory are redrawn from the copies saved on the phone. */
+    private fun restyle() {
+        styleGen++
+        SatMem.clear()
+        reloadSat()
+    }
+
+    fun updateEnhanced(v: Boolean) { if (v != enhanced) { enhanced = v; store.enhanced = v; restyle() } }
     fun updateOverlay(o: Overlay) {
         if (o == overlay) return
         overlay = o
         store.overlay = o.key
         overlayLegend = null
-        legendFor = null
         overlayMissing = false
-        reloadSat()
+        restyle()
     }
     fun updateShowSigmet(v: Boolean) { showSigmet = v; store.showSigmet = v; if (v) loadSigmets() }
     fun updateLoopHours(h: Int) { if (h != loopHours) { loopHours = h; store.loopHours = h; reloadSat() } }
     fun previewSensitivity(v: Float) { sensitivity = v }
-    fun commitSensitivity() { store.sensitivity = sensitivity; if (enhanced) reloadSat() }
-
-    /**
-     * Makes sure the satellite loop covers a map view (centre and scale in Mercator world units, size in pixels).
-     * Does nothing when the images already loaded cover it at a reasonable sharpness.
-     */
-    fun requestSatForView(cx: Double, cy: Double, scale: Double, wPx: Int, hPx: Int) {
-        if (scale <= 0.0 || wPx <= 0 || hPx <= 0) return
-        val vw = wPx / scale
-        val vh = hPx / scale
-        val view = GeoBounds(
-            west = Merc.lon((cx - vw / 2).coerceIn(0.0, 1.0)),
-            south = Merc.lat((cy + vh / 2).coerceIn(0.03, 0.97)),
-            east = Merc.lon((cx + vw / 2).coerceIn(0.0, 1.0)),
-            north = Merc.lat((cy - vh / 2).coerceIn(0.03, 0.97)),
-        )
-        val have = satRequest?.bounds
-        if (have != null && have.contains(view) && have.widthDeg <= view.widthDeg * 4.6) return
-        // A generous, grid-snapped area: panning nearby stays inside it, and coming back asks for the same box.
-        val b = snapBox(cx, cy, vw, vh, 2.0)
-        val want = GeoBounds(
-            west = Merc.lon(b[0].coerceIn(0.0, 1.0)),
-            south = Merc.lat(b[3].coerceIn(0.03, 0.97)),
-            east = Merc.lon(b[2].coerceIn(0.0, 1.0)),
-            north = Merc.lat(b[1].coerceIn(0.03, 0.97)),
-        )
-        val w: Int
-        val h: Int
-        if (hPx >= wPx) {
-            h = Sat.MAX_DIM
-            w = (Sat.MAX_DIM.toFloat() * wPx / hPx).toInt().coerceAtLeast(64)
-        } else {
-            w = Sat.MAX_DIM
-            h = (Sat.MAX_DIM.toFloat() * hPx / wPx).toInt().coerceAtLeast(64)
-        }
-        loadSat(SatRequest(want, w, h))
-    }
+    fun commitSensitivity() { store.sensitivity = sensitivity; if (enhanced) restyle() }
+    fun previewTopsFl(v: Int) { topsFl = v }
+    fun commitTopsFl() { store.topsFl = topsFl; if (overlay == Overlay.TOPS) restyle() }
 
     fun reloadSat() {
-        val req = satRequest ?: return
-        loadSat(req)
+        val r = satWanted ?: return
+        satWant(r, satLoop, force = true)
     }
 
-    /** Fetches the new image when the server has one newer than the newest on screen. */
+    /** Fetches the new picture when the satellite has one newer than the newest held. */
     fun checkSatUpdate() {
-        if (satLoading || satRequest == null) return
+        if (satWanted == null) return
         viewModelScope.launch {
             val latest = Sat.latestTime()
-            val shown = frames.lastOrNull()?.time
+            val shown = satTimes.lastOrNull()
             if (shown == null || latest.isAfter(shown)) reloadSat()
         }
     }
 
     /**
-     * Loads the loop for [req]. The newest image is fetched and shown first, the older ones fill in behind it,
-     * and images already on screen for the same area and settings are kept instead of fetched again.
+     * Loads the satellite tiles the map needs. Tiles already in memory are skipped, the newest frame is
+     * fetched first from the middle of the screen outwards, and the older loop frames fill in behind it.
      */
-    fun loadSat(req: SatRequest) {
+    internal fun satWant(r: TileRange, loop: Boolean, force: Boolean = false) {
+        if (!force && r == satWanted && loop == satLoop) return
+        satWanted = r
+        satLoop = loop
         satJob?.cancel()
-        satRequest = req
-        ensureGrid()
         val ctx = getApplication<Application>()
-        val hours = loopHours
-        val lut = Sat.buildLut(sensitivity, enhanced)
+        val gen = styleGen
         val kind = overlay
-        val tag = req.key + "|" + enhanced + "|" + sensitivity + "|" + kind.key
-        val keep: Map<Long, SatFrame> = if (tag == framesTag) frames.associateBy { it.time.epochSecond } else emptyMap()
+        val lut = Sat.buildLut(sensitivity, enhanced && kind != Overlay.TOPS)
+        val fromFl = topsFl
         satJob = viewModelScope.launch {
             satLoading = true
             satError = null
-            satLoaded = 0
             try {
                 val latest = Sat.latestTime()
-                val times = Sat.frameTimes(latest, hours)
-                satTotal = times.size
-                val done = HashMap<Long, SatFrame>()
-                for (t in times) keep[t.epochSecond]?.let { done[t.epochSecond] = it }
-                satLoaded = done.size
+                val times = if (loop) Sat.frameTimes(latest, loopHours) else listOf(latest)
+                if (times != satTimes) satTimes = times
 
-                suspend fun fetch(t: Instant) {
-                    val grey = Sat.loadGrey(ctx, t, req)
-                    if (grey != null) {
-                        val bmp = Sat.colourise(grey, lut)
-                        grey.recycle()
-                        val extra = Sat.loadOverlay(ctx, kind, t, req)
-                        done[t.epochSecond] = SatFrame(t, bmp, extra, req.bounds)
-                        frames = times.mapNotNull { done[it.epochSecond] }
-                        framesTag = tag
+                // The overlay's layer name and colour key are looked up once.
+                var table: ByteArray? = null
+                if (kind != Overlay.NONE) {
+                    if (!Sat.isResolved(kind) || (kind == Overlay.RAIN && overlayLegend == null) || (kind == Overlay.TOPS && topsTable == null)) {
+                        val legend = Sat.resolve(kind)
+                        if (kind == Overlay.RAIN && legend != null) overlayLegend = legend
+                        if (kind == Overlay.TOPS && Sat.isResolved(kind)) topsTable = Sat.buildTopsTable(legend)
                     }
-                    satLoaded += 1
+                    overlayMissing = Sat.unavailable(kind) || !Sat.isResolved(kind)
+                    table = topsTable
                 }
+                val withOverlay = kind != Overlay.NONE && Sat.isResolved(kind) && (kind != Overlay.TOPS || table != null)
 
-                if (done.isNotEmpty()) {
-                    frames = times.mapNotNull { done[it.epochSecond] }
-                }
-                val newest = times.last()
-                if (done[newest.epochSecond] == null) fetch(newest)
-                val gate = Semaphore(5)
+                val midX = (r.x0 + r.x1) / 2.0
+                val midY = (r.y0 + r.y1) / 2.0
+                val tiles = ArrayList<IntArray>()
+                for (y in r.y0..r.y1) for (x in r.x0..r.x1) tiles += intArrayOf(x, y)
+                tiles.sortBy { (it[0] - midX) * (it[0] - midX) + (it[1] - midY) * (it[1] - midY) }
+
+                satTotal = times.size * tiles.size
+                satLoaded = 0
+                var got = 0
+                val gate = Semaphore(6)
                 coroutineScope {
-                    for (t in times.dropLast(1).reversed()) {
-                        if (done[t.epochSecond] != null) continue
-                        launch { gate.withPermit { fetch(t) } }
+                    for (t in times.reversed()) {
+                        for (tile in tiles) {
+                            val x = tile[0]
+                            val y = tile[1]
+                            val key = SatMem.key(0, t, r.z, x, y)
+                            val oKey = SatMem.key(1, t, r.z, x, y)
+                            val haveIr = SatMem.mem.get(key) != null
+                            val haveOv = !withOverlay || SatMem.mem.get(oKey) != null
+                            if (haveIr && haveOv) { satLoaded++; got++; continue }
+                            launch {
+                                gate.withPermit {
+                                    if (!haveIr) {
+                                        val grey = Sat.loadIrTile(ctx, t, r.z, x, y)
+                                        if (grey != null) {
+                                            val bmp = Sat.colourise(grey, lut)
+                                            grey.recycle()
+                                            if (gen == styleGen) {
+                                                SatMem.mem.put(key, bmp.asImageBitmap())
+                                                SatMem.tick++
+                                                got++
+                                            }
+                                        }
+                                    }
+                                    if (!haveOv) {
+                                        val raw = Sat.loadOverlayTile(ctx, kind, t, r.z, x, y)
+                                        if (raw != null) {
+                                            val out = if (kind == Overlay.TOPS && table != null) {
+                                                Sat.recolourTops(raw, table, fromFl).also { raw.recycle() }
+                                            } else raw
+                                            if (gen == styleGen) {
+                                                SatMem.mem.put(oKey, out.asImageBitmap())
+                                                SatMem.tick++
+                                            }
+                                        }
+                                    }
+                                    satLoaded++
+                                }
+                            }
+                        }
                     }
                 }
-                overlayMissing = kind != Overlay.NONE && Sat.unavailable(kind)
-                if (kind != Overlay.NONE && legendFor != kind && !overlayMissing) {
-                    val legend = Sat.loadLegend(kind)
-                    if (legend != null) { overlayLegend = legend; legendFor = kind }
-                }
-                if (done.isEmpty()) {
-                    satError = if (frames.isEmpty()) "No satellite images for this area. Check your connection, or move the map."
-                    else "Couldn't load images here. Showing the last ones loaded."
-                }
+                if (got == 0) satError = "No satellite images for this area. Check your connection, or move the map."
                 Sat.trimCache(ctx)
             } finally {
                 // A newer load may already have replaced this one; only the current load clears the flag.
@@ -483,42 +489,71 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ------------------------------------------------------------ forecast map layers (icing, wind)
+    // ------------------------------------------------------------ forecast map layers (wind, icing)
 
     var showIcing by mutableStateOf(store.showIcing)
         private set
     var showWind by mutableStateOf(store.showWind)
         private set
-    var gridLevel by mutableStateOf(3)      // index into Upper.LEVELS_FT: FL140
+    var windAsArrows by mutableStateOf(store.windAsArrows)
+        private set
+    var gridLevel by mutableStateOf(store.gridLevel.coerceIn(0, Upper.GRID_LABELS.size - 1))
         private set
     var gridHour by mutableStateOf(0)       // hours ahead of now
         private set
-    var grid by mutableStateOf<WxGrid?>(null)
+    var windGrid by mutableStateOf<FcGrid?>(null)
+        private set
+    var iceGrid by mutableStateOf<FcGrid?>(null)
         private set
     var gridLoading by mutableStateOf(false)
         private set
     var gridError by mutableStateOf<String?>(null)
         private set
     private var gridJob: Job? = null
+    private var gridBox: DoubleArray? = null     // west, south, east, north
+    private var gridKey = ""
 
     fun updateShowIcing(v: Boolean) { showIcing = v; store.showIcing = v; ensureGrid() }
     fun updateShowWind(v: Boolean) { showWind = v; store.showWind = v; ensureGrid() }
-    fun updateGridLevel(i: Int) { gridLevel = i; ensureGrid() }
+    fun updateWindAsArrows(v: Boolean) { windAsArrows = v; store.windAsArrows = v }
+    fun updateGridLevel(i: Int) { gridLevel = i; store.gridLevel = i }
     fun updateGridHour(h: Int) { gridHour = h }
 
-    /** Fetches the forecast grid for the area on screen when a forecast layer is on and the data isn't there yet. */
-    fun ensureGrid() {
-        if (!showIcing && !showWind) return
-        val req = satRequest ?: return
-        val level = gridLevel
-        val key = req.key + "|" + level
-        val have = grid
-        if (have != null && have.key == key && System.currentTimeMillis() - have.fetchedAt < 60 * 60_000L) return
+    /** Tells the forecast layers which part of the map is on screen (centre and scale in Mercator world units). */
+    fun wantGrid(cx: Double, cy: Double, scale: Double, wPx: Int, hPx: Int) {
+        if (scale <= 0.0 || wPx <= 0 || hPx <= 0) return
+        // A grid-snapped area somewhat larger than the screen, so small moves reuse the same download.
+        val b = snapBox(cx, cy, wPx / scale, hPx / scale, 1.35)
+        val west = Merc.lon(b[0].coerceIn(0.0, 1.0))
+        val east = Merc.lon(b[2].coerceIn(0.0, 1.0))
+        val north = Merc.lat(b[1].coerceIn(0.03, 0.97))
+        val south = Merc.lat(b[3].coerceIn(0.03, 0.97))
+        if (east - west < 0.5 || north - south < 0.5) return
+        val key = "%.2f_%.2f_%.2f_%.2f".format(java.util.Locale.US, west, south, east, north).replace('-', 'm').replace('.', 'p')
+        if (key != gridKey) {
+            gridKey = key
+            gridBox = doubleArrayOf(west, south, east, north)
+        }
+        ensureGrid()
+    }
+
+    /** Downloads the forecast grids that are switched on and not yet held for the area on screen. */
+    private fun ensureGrid() {
+        val box = gridBox ?: return
+        val key = gridKey
+        val now = System.currentTimeMillis()
+        fun stale(g: FcGrid?) = g == null || g.key != key || now - g.fetchedAt > 60 * 60_000L
+        val needWind = showWind && stale(windGrid)
+        val needIce = showIcing && stale(iceGrid)
+        if (!needWind && !needIce) return
         gridJob?.cancel()
+        val ctx = getApplication<Application>()
         gridJob = viewModelScope.launch {
             gridLoading = true
             try {
-                grid = ExtraApi.grid(req.bounds, level, key)
+                delay(350)      // lets the map settle before spending a download
+                if (needWind) windGrid = ExtraApi.grid(ctx, GridKind.WIND, box[0], box[1], box[2], box[3], key)
+                if (needIce) iceGrid = ExtraApi.grid(ctx, GridKind.ICING, box[0], box[1], box[2], box[3], key)
                 gridError = null
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e

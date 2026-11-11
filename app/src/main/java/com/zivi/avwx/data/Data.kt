@@ -11,7 +11,6 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
-import com.zivi.avwx.wx.GeoBounds
 import com.zivi.avwx.wx.Merc
 import com.zivi.avwx.wx.Minima
 import com.zivi.avwx.wx.Upper
@@ -190,6 +189,20 @@ class Store(ctx: Context) {
     var showWind: Boolean
         get() = prefs.getBoolean("windArrows", false)
         set(v) = prefs.edit().putBoolean("windArrows", v).apply()
+
+    /** True = plain arrows with numbers instead of the moving wind lines. */
+    var windAsArrows: Boolean
+        get() = prefs.getBoolean("windStyleArrows", false)
+        set(v) = prefs.edit().putBoolean("windStyleArrows", v).apply()
+
+    var gridLevel: Int
+        get() = prefs.getInt("gridLevel", 0)
+        set(v) = prefs.edit().putInt("gridLevel", v).apply()
+
+    /** Cloud tops below this flight level are hidden in the Tops layer. */
+    var topsFl: Int
+        get() = prefs.getInt("topsFl", 250)
+        set(v) = prefs.edit().putInt("topsFl", v).apply()
 
     var showSigmet: Boolean
         get() = prefs.getBoolean("sigmet", true)
@@ -397,29 +410,80 @@ class Aloft(
     fun turbulenceBand(i: Int): String? = Upper.band(levels.indices.map { turbulence(it, i) })
 }
 
-/** Forecast at one level on a grid of points, for the map layers. Values are NaN where missing. */
-class WxGrid(
+enum class GridKind(val cols: Int, val rows: Int) {
+    WIND(14, 20),     // wind at every level
+    ICING(10, 12),    // temperature and humidity at the upper levels
+}
+
+/**
+ * Forecast values on an even latitude / longitude grid, for the map layers. Two values per point:
+ * for wind, [a] is the eastward and [b] the northward part in knots; for icing, temperature (C) and humidity (%).
+ * Indexed [level][hour][point], points row by row from the north-west corner. NaN where missing.
+ */
+class FcGrid(
     val key: String,
-    val level: Int,
-    val lats: DoubleArray,
-    val lons: DoubleArray,
-    val dLat: Double,
-    val dLon: Double,
-    val times: List<Instant>,
-    val speed: Array<FloatArray>,   // [point][hour]
-    val dir: Array<FloatArray>,
-    val temp: Array<FloatArray>,
-    val rh: Array<FloatArray>,
+    val kind: GridKind,
+    val west: Double, val south: Double, val east: Double, val north: Double,
+    val times: LongArray,
+    val a: Array<Array<FloatArray>>,
+    val b: Array<Array<FloatArray>>,
     val fetchedAt: Long,
 ) {
+    val cols = kind.cols
+    val rows = kind.rows
+    val dLon = (east - west) / cols
+    val dLat = (north - south) / rows
+
+    /** Index of the forecast hour nearest to [epochSec]. */
     fun indexAt(epochSec: Long): Int {
         var idx = 0
         var best = Long.MAX_VALUE
         for (i in times.indices) {
-            val d = kotlin.math.abs(times[i].epochSecond - epochSec)
+            val d = kotlin.math.abs(times[i] - epochSec)
             if (d < best) { best = d; idx = i }
         }
         return idx
+    }
+
+    /** Value at a position, blended from the four nearest grid points. False when outside the grid or missing. */
+    fun sample(level: Int, ti: Int, lat: Double, lon: Double, out: FloatArray): Boolean {
+        val fx = (lon - west) / dLon - 0.5
+        val fy = (north - lat) / dLat - 0.5
+        if (fx < -0.5 || fy < -0.5 || fx > cols - 0.5 || fy > rows - 0.5) return false
+        val x = fx.coerceIn(0.0, cols - 1.0)
+        val y = fy.coerceIn(0.0, rows - 1.0)
+        val x0 = x.toInt().coerceAtMost(cols - 2)
+        val y0 = y.toInt().coerceAtMost(rows - 2)
+        val tx = (x - x0).toFloat()
+        val ty = (y - y0).toFloat()
+        val i = y0 * cols + x0
+        val pa = a[level][ti]
+        val pb = b[level][ti]
+        val top = pa[i] + (pa[i + 1] - pa[i]) * tx
+        val bot = pa[i + cols] + (pa[i + cols + 1] - pa[i + cols]) * tx
+        out[0] = top + (bot - top) * ty
+        val top2 = pb[i] + (pb[i + 1] - pb[i]) * tx
+        val bot2 = pb[i + cols] + (pb[i + cols + 1] - pb[i + cols]) * tx
+        out[1] = top2 + (bot2 - top2) * ty
+        return !out[0].isNaN() && !out[1].isNaN()
+    }
+}
+
+/** Keeps requests to the free forecast service under its per-minute allowance. */
+object OmBudget {
+    private val used = ArrayList<LongArray>()   // [time, weight]
+
+    suspend fun take(weight: Int) {
+        while (true) {
+            val now = System.currentTimeMillis()
+            val free = synchronized(used) {
+                used.removeAll { now - it[0] > 61_000L }
+                val sum = used.sumOf { it[1] }
+                if (sum + weight <= 560 || used.isEmpty()) { used += longArrayOf(now, weight.toLong()); true } else false
+            }
+            if (free) return
+            kotlinx.coroutines.delay(2500)
+        }
     }
 }
 
@@ -558,48 +622,82 @@ object ExtraApi {
         )
     }
 
-    /** Wind, temperature and humidity at one level on a grid of points covering [b]. */
-    suspend fun grid(b: GeoBounds, level: Int, key: String): WxGrid = withContext(Dispatchers.IO) {
-        val cols = 6
-        val rows = 8
-        val dLon = (b.east - b.west) / cols
-        val dLat = (b.north - b.south) / rows
-        val n = cols * rows
-        val lats = DoubleArray(n)
-        val lons = DoubleArray(n)
-        for (r in 0 until rows) for (c in 0 until cols) {
-            lats[r * cols + c] = b.north - (r + 0.5) * dLat
-            lons[r * cols + c] = b.west + (c + 0.5) * dLon
+    /**
+     * Forecast grid for an area, for every map level at once, so changing level or time needs no new download.
+     * A copy is kept on the phone for an hour.
+     */
+    suspend fun grid(ctx: Context, kind: GridKind, west: Double, south: Double, east: Double, north: Double, key: String): FcGrid =
+        withContext(Dispatchers.IO) {
+            val cols = kind.cols
+            val rows = kind.rows
+            val n = cols * rows
+            val dLon = (east - west) / cols
+            val dLat = (north - south) / rows
+            val us = java.util.Locale.US
+            val lats = StringBuilder()
+            val lons = StringBuilder()
+            for (r in 0 until rows) for (c in 0 until cols) {
+                if (lats.isNotEmpty()) { lats.append(','); lons.append(',') }
+                lats.append("%.2f".format(us, north - (r + 0.5) * dLat))
+                lons.append("%.2f".format(us, west + (c + 0.5) * dLon))
+            }
+            val levels = Upper.GRID_HPA
+            fun names(level: Int): Pair<String, String>? {
+                val p = levels[level]
+                return when (kind) {
+                    GridKind.WIND -> if (p == null) "wind_speed_10m" to "wind_direction_10m" else "wind_speed_${p}hPa" to "wind_direction_${p}hPa"
+                    GridKind.ICING -> if (p == null) null else "temperature_${p}hPa" to "relative_humidity_${p}hPa"
+                }
+            }
+            val vars = levels.indices.mapNotNull { names(it) }.flatMap { listOf(it.first, it.second) }
+
+            val dir = File(ctx.cacheDir, "grid").apply { mkdirs() }
+            val file = File(dir, "${kind.name}_$key.json")
+            var fetchedAt = file.lastModified()
+            val text = if (file.exists() && file.length() > 1000 && System.currentTimeMillis() - fetchedAt < 60 * 60_000L) {
+                file.readText()
+            } else {
+                OmBudget.take((n * maxOf(1.0, vars.size / 10.0)).toInt())
+                val url = "https://api.open-meteo.com/v1/forecast?latitude=$lats&longitude=$lons&hourly=" + vars.joinToString(",") +
+                    "&wind_speed_unit=kn&forecast_days=3&timeformat=unixtime&timezone=GMT"
+                val t = Net.getText(url, maxBytes = 14_000_000).trim()
+                if (!t.startsWith("[")) throw java.io.IOException("forecast grid refused")
+                dir.listFiles()?.forEach { f -> if (System.currentTimeMillis() - f.lastModified() > 3 * 3600_000L) f.delete() }
+                file.writeText(t)
+                fetchedAt = System.currentTimeMillis()
+                t
+            }
+            val arr = JSONArray(text)
+            if (arr.length() < n) throw java.io.IOException("forecast grid incomplete")
+            val tArr = arr.getJSONObject(0).getJSONObject("hourly").getJSONArray("time")
+            val hours = tArr.length()
+            val times = LongArray(hours) { tArr.optLong(it) }
+            val a = Array(levels.size) { Array(hours) { FloatArray(n) { Float.NaN } } }
+            val b = Array(levels.size) { Array(hours) { FloatArray(n) { Float.NaN } } }
+            for (i in 0 until n) {
+                val h = arr.getJSONObject(i).getJSONObject("hourly")
+                for (level in levels.indices) {
+                    val nm = names(level) ?: continue
+                    val first = h.optJSONArray(nm.first) ?: continue
+                    val second = h.optJSONArray(nm.second) ?: continue
+                    for (t in 0 until minOf(hours, first.length(), second.length())) {
+                        if (first.isNull(t) || second.isNull(t)) continue
+                        val v1 = first.optDouble(t)
+                        val v2 = second.optDouble(t)
+                        if (kind == GridKind.WIND) {
+                            // Speed and the direction the wind comes from -> eastward and northward parts.
+                            val rad = Math.toRadians(v2)
+                            a[level][t][i] = (-v1 * Math.sin(rad)).toFloat()
+                            b[level][t][i] = (-v1 * Math.cos(rad)).toFloat()
+                        } else {
+                            a[level][t][i] = v1.toFloat()
+                            b[level][t][i] = v2.toFloat()
+                        }
+                    }
+                }
+            }
+            FcGrid(key, kind, west, south, east, north, times, a, b, fetchedAt)
         }
-        val p = Upper.LEVELS_HPA[level]
-        val us = java.util.Locale.US
-        val url = "https://api.open-meteo.com/v1/forecast" +
-            "?latitude=" + lats.joinToString(",") { "%.2f".format(us, it) } +
-            "&longitude=" + lons.joinToString(",") { "%.2f".format(us, it) } +
-            "&hourly=wind_speed_${p}hPa,wind_direction_${p}hPa,temperature_${p}hPa,relative_humidity_${p}hPa" +
-            "&wind_speed_unit=kn&forecast_days=2&timezone=GMT"
-        val text = Net.getText(url, maxBytes = 4_000_000).trim()
-        val arr = if (text.startsWith("[")) JSONArray(text) else JSONArray().put(JSONObject(text))
-        if (arr.length() < n) throw java.io.IOException("grid incomplete")
-        var times: List<Instant> = emptyList()
-        fun col(h: JSONObject, name: String, size: Int): FloatArray {
-            val a = h.optJSONArray(name)
-            return FloatArray(size) { i -> if (a == null || i >= a.length() || a.isNull(i)) Float.NaN else a.optDouble(i).toFloat() }
-        }
-        val speed = ArrayList<FloatArray>()
-        val dir = ArrayList<FloatArray>()
-        val temp = ArrayList<FloatArray>()
-        val rh = ArrayList<FloatArray>()
-        for (i in 0 until n) {
-            val h = arr.getJSONObject(i).getJSONObject("hourly")
-            if (i == 0) times = parseTimes(h)
-            speed += col(h, "wind_speed_${p}hPa", times.size)
-            dir += col(h, "wind_direction_${p}hPa", times.size)
-            temp += col(h, "temperature_${p}hPa", times.size)
-            rh += col(h, "relative_humidity_${p}hPa", times.size)
-        }
-        WxGrid(key, level, lats, lons, dLat, dLon, times, speed.toTypedArray(), dir.toTypedArray(), temp.toTypedArray(), rh.toTypedArray(), System.currentTimeMillis())
-    }
 }
 
 // ---------------------------------------------------------------- base map tiles
@@ -655,14 +753,6 @@ object Tiles {
 
 // ---------------------------------------------------------------- satellite
 
-/** The area and picture size a set of satellite images was requested for. */
-class SatRequest(val bounds: GeoBounds, val width: Int, val height: Int) {
-    val key: String = "%.2f_%.2f_%.2f_%.2f_%dx%d".format(bounds.west, bounds.south, bounds.east, bounds.north, width, height)
-        .replace('-', 'm').replace('.', 'p')
-}
-
-class SatFrame(val time: Instant, val bitmap: Bitmap, val overlay: Bitmap?, val bounds: GeoBounds)
-
 /** Extra EUMETSAT products that can be laid over the cloud picture. */
 enum class Overlay(val key: String, val guesses: List<String>, val match: Regex) {
     NONE("none", emptyList(), Regex("$^")),
@@ -674,9 +764,13 @@ enum class Overlay(val key: String, val guesses: List<String>, val match: Regex)
     }
 }
 
+/**
+ * Satellite pictures, fetched as 256 px map tiles so that parts already downloaded are reused when the map
+ * is moved or zoomed. Each tile is kept on the phone for a few hours.
+ */
 object Sat {
     const val STEP_MIN = 15L
-    const val MAX_DIM = 1024
+    const val MAX_ZOOM = 6          // about 2.4 km per pixel, as fine as the satellite sees here
 
     private const val WMS = "https://view.eumetsat.int/geoserver/wms"
     private const val LAYER = "msg_iodc%3Air108"
@@ -685,6 +779,7 @@ object Sat {
 
     private val resolved = java.util.concurrent.ConcurrentHashMap<Overlay, String>()
     private val missing = java.util.concurrent.ConcurrentHashMap<Overlay, Boolean>()
+    private val noData = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
     @Volatile private var serverLayers: List<String>? = null
     @Volatile private var latestCached: Instant? = null
     @Volatile private var latestAt = 0L
@@ -759,126 +854,129 @@ object Sat {
         return (n downTo 0).map { latest.minusSeconds(it * STEP_MIN * 60) }
     }
 
-    private fun mapUrl(layer: String, format: String, time: Instant?, transparent: Boolean, req: SatRequest): String {
-        val b = req.bounds
+    private fun tileUrl(layerEnc: String, format: String, time: Instant, transparent: Boolean, z: Int, x: Int, y: Int): String {
+        val n = (1 shl z).toDouble()
         val sb = StringBuilder(WMS)
-        sb.append("?service=WMS&version=1.1.1&request=GetMap&layers=").append(layer)
+        sb.append("?service=WMS&version=1.1.1&request=GetMap&layers=").append(layerEnc)
         sb.append("&styles=&format=").append(format)
         sb.append("&srs=EPSG%3A3857&bbox=")
-        sb.append("%.1f,%.1f,%.1f,%.1f".format(
-            java.util.Locale.US, Merc.metresX(b.west), Merc.metresY(b.south), Merc.metresX(b.east), Merc.metresY(b.north)))
-        sb.append("&width=${req.width}&height=${req.height}")
+        sb.append("%.2f,%.2f,%.2f,%.2f".format(
+            java.util.Locale.US, Merc.mx(x / n), Merc.my((y + 1) / n), Merc.mx((x + 1) / n), Merc.my(y / n)))
+        sb.append("&width=256&height=256")
         if (transparent) sb.append("&transparent=true")
-        if (time != null) sb.append("&time=").append(time.toString().replace(":", "%3A"))
+        sb.append("&time=").append(time.toString().replace(":", "%3A"))
         return sb.toString()
     }
 
     private fun cacheDir(ctx: Context): File = File(ctx.cacheDir, "sat").apply { mkdirs() }
 
-    /** Removes cached images older than 4 hours, and the oldest ones beyond a fixed count. */
-    fun trimCache(ctx: Context) {
+    /** Removes saved tiles older than 4 hours, and the oldest ones beyond a fixed count. */
+    suspend fun trimCache(ctx: Context) = withContext(Dispatchers.IO) {
         val cutoff = System.currentTimeMillis() - 4 * 3600_000L
-        val files = cacheDir(ctx).listFiles() ?: return
+        val files = cacheDir(ctx).listFiles() ?: return@withContext
         files.forEach { f -> if (f.lastModified() < cutoff) f.delete() }
-        // Panning makes a new set each time; keep only the newest few hundred files.
-        files.filter { it.exists() }.sortedByDescending { it.lastModified() }.drop(260).forEach { it.delete() }
+        files.filter { it.exists() }.sortedByDescending { it.lastModified() }.drop(2500).forEach { it.delete() }
     }
 
-    /** Greyscale IR image for [time], from disk if already downloaded. Null when the server has no usable image. */
-    suspend fun loadGrey(ctx: Context, time: Instant, req: SatRequest): Bitmap? = withContext(Dispatchers.IO) {
-        val f = File(cacheDir(ctx), "ir_${time.epochSecond}_${req.key}.jpg")
+    /** Greyscale infrared tile, from the phone if already downloaded. Null when the satellite has nothing there. */
+    suspend fun loadIrTile(ctx: Context, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
+        val name = "ir_${time.epochSecond}_${z}_${x}_$y"
+        if (noData.containsKey(name)) return@withContext null
+        val f = File(cacheDir(ctx), name)
         try {
-            val bytes = if (f.exists() && f.length() > 1000) f.readBytes()
-            else Net.getBytes(mapUrl(LAYER, "image%2Fjpeg", time, false, req))
             val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+            if (f.exists() && f.length() > 300) {
+                val saved = BitmapFactory.decodeFile(f.absolutePath, opts)
+                if (saved != null) return@withContext saved
+            }
+            val bytes = Net.getBytes(tileUrl(LAYER, "image%2Fjpeg", time, false, z, x, y), maxBytes = 2_000_000)
             val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return@withContext null
-            if (isBlank(bmp)) { bmp.recycle(); f.delete(); return@withContext null }
-            if (!f.exists()) f.writeBytes(bytes)
+            if (isFlat(bmp)) { bmp.recycle(); noData[name] = true; return@withContext null }
+            f.writeBytes(bytes)
             bmp
         } catch (e: Exception) {
             null
         }
     }
 
-    /** An overlay picture (transparent where there is nothing to show) for [time]. */
-    suspend fun loadOverlay(ctx: Context, o: Overlay, time: Instant, req: SatRequest): Bitmap? = withContext(Dispatchers.IO) {
+    /** Finds which layer name the server uses for an overlay and returns that layer's colour key. */
+    suspend fun resolve(o: Overlay): Bitmap? = withContext(Dispatchers.IO) {
         if (o == Overlay.NONE || unavailable(o)) return@withContext null
-        val f = File(cacheDir(ctx), "${o.key}_${time.epochSecond}_${req.key}.png")
-        try {
-            if (f.exists() && f.length() > 100) {
-                return@withContext BitmapFactory.decodeFile(f.absolutePath)
-            }
-            for (layer in candidates(o)) {
-                val bytes = try {
-                    Net.getBytes(mapUrl(layer.replace(":", "%3A"), "image%2Fpng", time, true, req))
-                } catch (e: Exception) {
-                    continue
-                }
-                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: continue
-                resolved[o] = layer
-                f.writeBytes(bytes)
-                return@withContext bmp
-            }
-            if (resolved[o] == null) missing[o] = true
-            null
-        } catch (e: Exception) {
-            null
+        for (layer in candidates(o)) {
+            val legend = try {
+                val bytes = Net.getBytes(
+                    "$WMS?service=WMS&version=1.1.1&request=GetLegendGraphic&format=image%2Fpng&layer=" + layer.replace(":", "%3A"),
+                    maxBytes = 500_000,
+                )
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            } catch (e: Exception) {
+                null
+            } ?: continue
+            resolved[o] = layer
+            return@withContext legend
         }
+        // Only called a failure when the server answered the layer list but none of the names worked.
+        if (serverLayers != null) missing[o] = true
+        null
     }
 
-    /** The server's own colour key for an overlay, once its layer is known. */
-    suspend fun loadLegend(o: Overlay): Bitmap? = withContext(Dispatchers.IO) {
+    fun isResolved(o: Overlay): Boolean = resolved[o] != null
+
+    /** An overlay tile (transparent where there is nothing to show) in the server's own colours. */
+    suspend fun loadOverlayTile(ctx: Context, o: Overlay, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
         val layer = resolved[o] ?: return@withContext null
+        val f = File(cacheDir(ctx), "${o.key}_${time.epochSecond}_${z}_${x}_$y")
         try {
-            val bytes = Net.getBytes(
-                "$WMS?service=WMS&version=1.1.1&request=GetLegendGraphic&format=image%2Fpng&layer=" + layer.replace(":", "%3A"),
-                maxBytes = 500_000,
-            )
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+            if (f.exists() && f.length() > 60) {
+                val saved = BitmapFactory.decodeFile(f.absolutePath, opts)
+                if (saved != null) return@withContext saved
+            }
+            val bytes = Net.getBytes(tileUrl(layer.replace(":", "%3A"), "image%2Fpng", time, true, z, x, y), maxBytes = 2_000_000)
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return@withContext null
+            f.writeBytes(bytes)
+            bmp
         } catch (e: Exception) {
             null
         }
     }
 
-    /** True when the picture is one flat colour (the server had no data for that time or place). */
-    private fun isBlank(b: Bitmap): Boolean {
-        var min = 255
-        var max = 0
-        val stepX = b.width / 14
-        val stepY = b.height / 14
-        if (stepX == 0 || stepY == 0) return true
-        var y = stepY / 2
+    /** True when every sampled pixel is the same (the server had no picture for that time or place). */
+    private fun isFlat(b: Bitmap): Boolean {
+        val first = b.getPixel(b.width / 2, b.height / 2) and 0xFF
+        val step = b.width / 9
+        if (step == 0) return true
+        var y = step / 2
         while (y < b.height) {
-            var x = stepX / 2
+            var x = step / 2
             while (x < b.width) {
-                val g = (b.getPixel(x, y) shr 8) and 0xFF
-                if (g < min) min = g
-                if (g > max) max = g
-                x += stepX
+                if (kotlin.math.abs((b.getPixel(x, y) and 0xFF) - first) > 2) return false
+                x += step
             }
-            y += stepY
+            y += step
         }
-        return max - min < 3
+        return true
     }
 
     // ---- colour enhancement
 
     /** Stops of the enhancement scale, from the first coloured cloud tops to the coldest. */
     val SCALE = intArrayOf(
-        0x2E9E4F,  // green
-        0xE8D53A,  // yellow
-        0xF29A2E,  // orange
+        0x3F7FE8,  // blue: mid-level cloud
+        0x35B84B,  // green
+        0xF2E03A,  // yellow
+        0xF2952E,  // orange
         0xE5352B,  // red
         0xC21FB5,  // magenta
-        0xF5E9FF,  // near white: coldest tops
+        0xF7EEFF,  // near white: coldest tops
     )
 
     /** Brightness (0..255) where colour begins for a given sensitivity. */
-    fun threshold(sensitivity: Float): Int = (185 - 70 * sensitivity.coerceIn(0f, 1f)).toInt()
+    fun threshold(sensitivity: Float): Int = (172 - 62 * sensitivity.coerceIn(0f, 1f)).toInt()
 
     /**
      * Lookup from image brightness to an overlay colour. Clear sea and land become transparent so the
-     * map shows through; ordinary cloud is drawn white; cold tops take the colour scale when [colour] is on.
+     * map shows through; low cloud is drawn grey-white; colder tops take the colour scale when [colour] is on.
      */
     fun buildLut(sensitivity: Float, colour: Boolean): IntArray {
         val start = threshold(sensitivity)
@@ -889,19 +987,19 @@ object Sat {
             if (!colour || g < start) {
                 val top = if (colour) start else 215
                 val t = ((g - cloudFrom).toFloat() / (top - cloudFrom).coerceAtLeast(1)).coerceIn(0f, 1f)
-                val a = (t * 0.88f * 255).toInt()
-                val v = (205 + 50 * t).toInt().coerceAtMost(255)
+                val a = (t * 0.86f * 255).toInt()
+                val v = (190 + 60 * t).toInt().coerceAtMost(255)
                 lut[g] = (a shl 24) or (v shl 16) or (v shl 8) or v
             } else {
                 val p = (g - start).toFloat() / (255 - start).coerceAtLeast(1) * (SCALE.size - 1)
                 val i = p.toInt().coerceIn(0, SCALE.size - 2)
-                lut[g] = (0xF2 shl 24) or mix(SCALE[i], SCALE[i + 1], p - i)
+                lut[g] = (0xEE shl 24) or mix(SCALE[i], SCALE[i + 1], p - i)
             }
         }
         return lut
     }
 
-    private fun mix(a: Int, b: Int, t: Float): Int {
+    fun mix(a: Int, b: Int, t: Float): Int {
         val tt = t.coerceIn(0f, 1f)
         val r = ((a shr 16 and 0xFF) + ((b shr 16 and 0xFF) - (a shr 16 and 0xFF)) * tt).toInt()
         val g = ((a shr 8 and 0xFF) + ((b shr 8 and 0xFF) - (a shr 8 and 0xFF)) * tt).toInt()
@@ -909,7 +1007,7 @@ object Sat {
         return (r shl 16) or (g shl 8) or bl
     }
 
-    /** Turns a greyscale image into a see-through cloud overlay using [lut]. */
+    /** Turns a greyscale tile into a see-through cloud tile using [lut]. */
     suspend fun colourise(grey: Bitmap, lut: IntArray): Bitmap = withContext(Dispatchers.Default) {
         val w = grey.width
         val h = grey.height
@@ -919,6 +1017,111 @@ object Sat {
             val p = px[i]
             val lum = ((p shr 16 and 0xFF) * 3 + (p shr 8 and 0xFF) * 6 + (p and 0xFF)) / 10
             px[i] = lut[lum]
+        }
+        Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+    }
+
+    // ---- cloud top height
+
+    private const val TOPS_MIN_M = 320.0
+    private const val TOPS_MAX_M = 16000.0
+
+    /** The usual colours of the cloud-top-height product, lowest to highest, used if the server's key can't be read. */
+    private val TOPS_FALLBACK = intArrayOf(
+        0x000000, 0x5A1E1E, 0x7B2CBF, 0x2B3FD6, 0x3FA9F5, 0x38D9C5, 0x3CCB4A,
+        0xB5E12F, 0xF5E02F, 0xF59A23, 0xE53222, 0x9E9E9E, 0xFFFFFF,
+    )
+
+    /** The colour bar inside the server's colour key: the longest unbroken run of non-white pixels. */
+    private fun rampFrom(legend: Bitmap?): IntArray? {
+        if (legend == null) return null
+        var bestY = -1
+        var bestX = 0
+        var bestLen = 0
+        val row = IntArray(legend.width)
+        for (y in 0 until legend.height) {
+            legend.getPixels(row, 0, legend.width, 0, y, legend.width, 1)
+            var runStart = -1
+            for (x in 0..row.size) {
+                var solid = false
+                if (x < row.size) {
+                    val p = row[x]
+                    solid = (p ushr 24) > 128 && !((p shr 16 and 0xFF) > 244 && (p shr 8 and 0xFF) > 244 && (p and 0xFF) > 244)
+                }
+                if (solid) {
+                    if (runStart < 0) runStart = x
+                } else if (runStart >= 0) {
+                    val len = x - runStart
+                    if (len > bestLen) { bestLen = len; bestX = runStart; bestY = y }
+                    runStart = -1
+                }
+            }
+        }
+        if (bestLen < 40) return null
+        legend.getPixels(row, 0, legend.width, 0, bestY, legend.width, 1)
+        val colours = IntArray(bestLen) { row[bestX + it] and 0xFFFFFF }
+        // A real colour bar has many different colours; a line of text or a border does not.
+        return if (colours.toSet().size >= 12) colours else null
+    }
+
+    /**
+     * Table from a (coarsened) picture colour to a cloud-top height, in steps of 1/255 of the product's range.
+     * Built from the server's own colour key when it can be read.
+     */
+    suspend fun buildTopsTable(legend: Bitmap?): ByteArray = withContext(Dispatchers.Default) {
+        val bar = rampFrom(legend)
+        val n = 96
+        val ramp = IntArray(n) { i ->
+            val f = i / (n - 1f)
+            if (bar != null) bar[(f * (bar.size - 1)).toInt()]
+            else {
+                val p = f * (TOPS_FALLBACK.size - 1)
+                val k = p.toInt().coerceAtMost(TOPS_FALLBACK.size - 2)
+                mix(TOPS_FALLBACK[k], TOPS_FALLBACK[k + 1], p - k)
+            }
+        }
+        val table = ByteArray(32768)
+        for (idx in 0 until 32768) {
+            val r = (idx shr 10 and 31) * 8 + 4
+            val g = (idx shr 5 and 31) * 8 + 4
+            val b = (idx and 31) * 8 + 4
+            var best = 0
+            var bestD = Int.MAX_VALUE
+            for (k in 0 until n) {
+                val c = ramp[k]
+                val dr = r - (c shr 16 and 0xFF)
+                val dg = g - (c shr 8 and 0xFF)
+                val db = b - (c and 0xFF)
+                val d = dr * dr + dg * dg + db * db
+                if (d < bestD) { bestD = d; best = k }
+            }
+            table[idx] = (best * 255 / (n - 1)).toByte()
+        }
+        table
+    }
+
+    /** Recolours a cloud-top-height tile: tops below [fromFl] disappear, higher tops run yellow to white. */
+    suspend fun recolourTops(src: Bitmap, table: ByteArray, fromFl: Int): Bitmap = withContext(Dispatchers.Default) {
+        val w = src.width
+        val h = src.height
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        val fromFt = fromFl * 100.0
+        val scale = Upper.TOPS_SCALE
+        // Colour for each of the 256 table steps, worked out once.
+        val out = IntArray(256)
+        for (k in 0..255) {
+            val ft = (TOPS_MIN_M + (TOPS_MAX_M - TOPS_MIN_M) * k / 255.0) * 3.28084
+            if (ft < fromFt) { out[k] = 0; continue }
+            val p = ((ft - fromFt) / (50000.0 - fromFt)).coerceIn(0.0, 1.0).toFloat() * (scale.size - 1)
+            val i = p.toInt().coerceAtMost(scale.size - 2)
+            out[k] = (0xE6 shl 24) or mix(scale[i], scale[i + 1], p - i)
+        }
+        for (i in px.indices) {
+            val p = px[i]
+            if ((p ushr 24) < 60) { px[i] = 0; continue }
+            val idx = ((p shr 19 and 31) shl 10) or ((p shr 11 and 31) shl 5) or (p shr 3 and 31)
+            px[i] = out[table[idx].toInt() and 0xFF]
         }
         Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
     }

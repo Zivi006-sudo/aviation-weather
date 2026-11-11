@@ -95,13 +95,34 @@ fun SettingsScreen(vm: AppViewModel) {
                 )
             }
 
+            Section("Map layers") {
+                Text("Show cloud tops above FL${vm.topsFl}", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                Text(
+                    "The Tops layer colours only cloud higher than this, so tall cells stand out from the general cloud sheet.",
+                    fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Slider(
+                    value = vm.topsFl.toFloat(),
+                    onValueChange = { vm.previewTopsFl((it / 10f).toInt() * 10) },
+                    onValueChangeFinished = { vm.commitTopsFl() },
+                    valueRange = 150f..400f,
+                    steps = 24,
+                )
+                Spacer(Modifier.height(4.dp))
+                SwitchRow(
+                    "Wind as arrows",
+                    "Shows wind as arrows with speeds instead of moving lines.",
+                    vm.windAsArrows,
+                ) { vm.updateWindAsArrows(it) }
+            }
+
             Section("Data sources") {
                 Text(
                     "METAR and TAF: Aviation Weather Center (aviationweather.gov) and the Maldives Meteorological Service " +
                         "aviation page; the newer report for each airport is shown.\n" +
                         "SIGMET: Aviation Weather Center.\n" +
                         "Satellite, rain rate and cloud top height: EUMETSAT Meteosat, Indian Ocean coverage, every 15 minutes.\n" +
-                        "Upper winds, freezing level, icing, turbulence and thunderstorm risk: Open-Meteo model forecast.\n" +
+                        "Wind, freezing level, icing, turbulence and thunderstorm risk: Open-Meteo model forecast.\n" +
                         "Live traffic: airplanes.live and adsb.lol community receivers. Aircraft outside their coverage are not shown.\n" +
                         "Radar imagery: Sentinel-2 cloudless by EOX IT Services GmbH (contains modified Copernicus Sentinel data 2024).\n" +
                         "NOTAMs: link to the airport's page on Windy.\n" +
