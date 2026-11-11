@@ -199,6 +199,10 @@ class Store(ctx: Context) {
         get() = prefs.getInt("gridLevel", 0)
         set(v) = prefs.edit().putInt("gridLevel", v).apply()
 
+    var showLightRain: Boolean
+        get() = prefs.getBoolean("lightRain", false)
+        set(v) = prefs.edit().putBoolean("lightRain", v).apply()
+
     /** Cloud tops below this flight level are hidden in the Tops layer. */
     var topsFl: Int
         get() = prefs.getInt("topsFl", 250)
@@ -754,10 +758,10 @@ object Tiles {
 // ---------------------------------------------------------------- satellite
 
 /** Extra EUMETSAT products that can be laid over the cloud picture. */
-enum class Overlay(val key: String, val guesses: List<String>, val match: Regex) {
-    NONE("none", emptyList(), Regex("$^")),
-    RAIN("rain", listOf("msg_iodc:h63", "msg_iodc:mpe", "msg_iodc:h60b"), Regex("(^|:)(h63|h60b?|mpe)$")),
-    TOPS("cth", listOf("msg_iodc:cth"), Regex("(^|:)cth$"));
+enum class Overlay(val key: String, val guesses: List<String>, val match: Regex, val west: List<String>) {
+    NONE("none", emptyList(), Regex("$^"), emptyList()),
+    RAIN("rain", listOf("msg_iodc:h63", "msg_iodc:mpe", "msg_iodc:h60b"), Regex("(^|:)(h63|h60b?|mpe)$"), listOf("msg_fes:h60b", "msg_fes:h60")),
+    TOPS("cth", listOf("msg_iodc:cth"), Regex("(^|:)cth$"), listOf("msg_fes:cth"));
 
     companion object {
         fun of(key: String): Overlay = values().firstOrNull { it.key == key } ?: NONE
@@ -765,26 +769,75 @@ enum class Overlay(val key: String, val guesses: List<String>, val match: Regex)
 }
 
 /**
+ * One weather satellite. [lon] is where it sits over the equator. EUMETSAT pictures come as plain grey
+ * infrared ([irLayers]); NASA's ([gibs]) come already coloured.
+ */
+class SatSource(val id: Int, val lon: Double, val gibs: String?, val irLayers: List<String>)
+
+/**
  * Satellite pictures, fetched as 256 px map tiles so that parts already downloaded are reused when the map
- * is moved or zoomed. Each tile is kept on the phone for a few hours.
+ * is moved or zoomed. Five satellites cover the globe; each tile comes from the one nearest to it.
  */
 object Sat {
     const val STEP_MIN = 15L
-    const val MAX_ZOOM = 6          // about 2.4 km per pixel, as fine as the satellite sees here
+    const val MAX_ZOOM = 6          // about 2.4 km per pixel, as fine as the satellites see
+
+    val SOURCES = listOf(
+        SatSource(0, 45.5, null, listOf("msg_iodc:ir108")),                       // Meteosat, Indian Ocean
+        SatSource(1, 0.0, null, listOf("msg_fes:ir108", "mtg_fd:ir105_hrfi")),    // Meteosat, Africa and Europe
+        SatSource(2, -75.2, "GOES-East_ABI_Band13_Clean_Infrared", emptyList()),
+        SatSource(3, -137.2, "GOES-West_ABI_Band13_Clean_Infrared", emptyList()),
+        SatSource(4, 140.7, "Himawari_AHI_Band13_Clean_Infrared", emptyList()),
+    )
 
     private const val WMS = "https://view.eumetsat.int/geoserver/wms"
-    private const val LAYER = "msg_iodc%3Air108"
     private val ISO_RE = Regex("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z")
     private val NAME_RE = Regex("<Name>([^<]+)</Name>")
 
     private val resolved = java.util.concurrent.ConcurrentHashMap<Overlay, String>()
     private val missing = java.util.concurrent.ConcurrentHashMap<Overlay, Boolean>()
     private val noData = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    private val irLayerIdx = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+    private val westFails = java.util.concurrent.ConcurrentHashMap<Overlay, Int>()
+    private val gibsLatest = java.util.concurrent.ConcurrentHashMap<Int, Instant>()
+    private val gibsProbedAt = java.util.concurrent.ConcurrentHashMap<Int, Long>()
     @Volatile private var serverLayers: List<String>? = null
     @Volatile private var latestCached: Instant? = null
     @Volatile private var latestAt = 0L
 
     fun unavailable(o: Overlay): Boolean = missing[o] == true
+
+    /** The satellite a tile is taken from: the one sitting nearest to the tile's middle. */
+    fun sourceFor(z: Int, x: Int): SatSource {
+        val lon = (x + 0.5) / (1 shl z) * 360.0 - 180.0
+        var best = SOURCES[0]
+        var bestD = 999.0
+        for (s in SOURCES) {
+            val d0 = kotlin.math.abs(lon - s.lon)
+            val d = if (d0 > 180.0) 360.0 - d0 else d0
+            if (d < bestD) { bestD = d; best = s }
+        }
+        return best
+    }
+
+    fun sourcesIn(z: Int, x0: Int, x1: Int): Set<SatSource> {
+        val out = HashSet<SatSource>()
+        for (x in x0..x1) out += sourceFor(z, x)
+        return out
+    }
+
+    fun latestOf(src: SatSource): Instant? = gibsLatest[src.id]
+
+    /**
+     * The picture time a satellite has for a loop frame. NASA's satellites take pictures every 10 minutes and
+     * can run behind, so the frame time is matched to their nearest earlier picture. Null until that is known.
+     */
+    fun timeFor(src: SatSource, frame: Instant): Instant? {
+        if (src.gibs == null) return frame
+        val latest = gibsLatest[src.id] ?: return null
+        val t = Instant.ofEpochSecond(frame.epochSecond / 600 * 600)
+        return if (t.isAfter(latest)) latest else t
+    }
 
     /** Layer names the server lists for the Indian Ocean satellite, read once. */
     private fun listLayers(): List<String> {
@@ -818,7 +871,7 @@ object Sat {
     /** Time of the newest image the server lists; falls back to an estimate if the listing can't be read. */
     suspend fun latestTime(): Instant = withContext(Dispatchers.IO) {
         val cached = latestCached
-        if (cached != null && System.currentTimeMillis() - latestAt < 120_000L) return@withContext cached
+        if (cached != null && System.currentTimeMillis() - latestAt < 90_000L) return@withContext cached
         val t = fetchLatestTime()
         latestCached = t
         latestAt = System.currentTimeMillis()
@@ -854,7 +907,7 @@ object Sat {
         return (n downTo 0).map { latest.minusSeconds(it * STEP_MIN * 60) }
     }
 
-    private fun tileUrl(layerEnc: String, format: String, time: Instant, transparent: Boolean, z: Int, x: Int, y: Int): String {
+    private fun wmsTileUrl(layerEnc: String, format: String, time: Instant, transparent: Boolean, z: Int, x: Int, y: Int): String {
         val n = (1 shl z).toDouble()
         val sb = StringBuilder(WMS)
         sb.append("?service=WMS&version=1.1.1&request=GetMap&layers=").append(layerEnc)
@@ -868,19 +921,35 @@ object Sat {
         return sb.toString()
     }
 
+    private fun gibsUrl(src: SatSource, time: Instant, z: Int, x: Int, y: Int): String =
+        "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/${src.gibs}/default/$time/GoogleMapsCompatible_Level6/$z/$y/$x.png"
+
     private fun cacheDir(ctx: Context): File = File(ctx.cacheDir, "sat").apply { mkdirs() }
 
-    /** Removes saved tiles older than 4 hours, and the oldest ones beyond a fixed count. */
+    /** Removes saved tiles older than 8 hours, and the oldest ones beyond a fixed count. */
     suspend fun trimCache(ctx: Context) = withContext(Dispatchers.IO) {
-        val cutoff = System.currentTimeMillis() - 4 * 3600_000L
+        val cutoff = System.currentTimeMillis() - 8 * 3600_000L
         val files = cacheDir(ctx).listFiles() ?: return@withContext
+        if (files.size < 300) return@withContext
         files.forEach { f -> if (f.lastModified() < cutoff) f.delete() }
-        files.filter { it.exists() }.sortedByDescending { it.lastModified() }.drop(2500).forEach { it.delete() }
+        files.filter { it.exists() }.sortedByDescending { it.lastModified() }.drop(6000).forEach { it.delete() }
     }
 
-    /** Greyscale infrared tile, from the phone if already downloaded. Null when the satellite has nothing there. */
-    suspend fun loadIrTile(ctx: Context, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
-        val name = "ir_${time.epochSecond}_${z}_${x}_$y"
+    /** Megabytes of satellite and forecast data saved on the phone. */
+    suspend fun cacheMb(ctx: Context): Int = withContext(Dispatchers.IO) {
+        var bytes = 0L
+        for (name in listOf("sat", "grid")) File(ctx.cacheDir, name).listFiles()?.forEach { bytes += it.length() }
+        ((bytes + 524_288) / 1_048_576).toInt()
+    }
+
+    suspend fun clearCache(ctx: Context) = withContext(Dispatchers.IO) {
+        for (name in listOf("sat", "grid")) File(ctx.cacheDir, name).listFiles()?.forEach { it.delete() }
+        noData.clear()
+    }
+
+    /** Greyscale infrared tile from a EUMETSAT satellite, from the phone if already downloaded. */
+    suspend fun loadIrTile(ctx: Context, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
+        val name = "ir${src.id}_${time.epochSecond}_${z}_${x}_$y"
         if (noData.containsKey(name)) return@withContext null
         val f = File(cacheDir(ctx), name)
         try {
@@ -889,9 +958,41 @@ object Sat {
                 val saved = BitmapFactory.decodeFile(f.absolutePath, opts)
                 if (saved != null) return@withContext saved
             }
-            val bytes = Net.getBytes(tileUrl(LAYER, "image%2Fjpeg", time, false, z, x, y), maxBytes = 2_000_000)
+            // A satellite may be listed under more than one layer name; the first that answers is remembered.
+            val known = irLayerIdx[src.id]
+            val tryList = if (known != null) listOf(known) else src.irLayers.indices.toList()
+            var answered = false
+            for (i in tryList) {
+                val bytes = try {
+                    Net.getBytes(wmsTileUrl(src.irLayers[i].replace(":", "%3A"), "image%2Fjpeg", time, false, z, x, y), maxBytes = 2_000_000)
+                } catch (e: Exception) {
+                    continue
+                }
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: continue
+                answered = true
+                if (isFlat(bmp)) { bmp.recycle(); continue }
+                irLayerIdx[src.id] = i
+                f.writeBytes(bytes)
+                return@withContext bmp
+            }
+            if (answered) noData[name] = true
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Coloured infrared tile from one of NASA's satellites, from the phone if already downloaded. */
+    suspend fun loadGibsTile(ctx: Context, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
+        val f = File(cacheDir(ctx), "ir${src.id}_${time.epochSecond}_${z}_${x}_$y")
+        try {
+            val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+            if (f.exists() && f.length() > 100) {
+                val saved = BitmapFactory.decodeFile(f.absolutePath, opts)
+                if (saved != null) return@withContext saved
+            }
+            val bytes = Net.getBytes(gibsUrl(src, time, z, x, y), maxBytes = 2_000_000)
             val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return@withContext null
-            if (isFlat(bmp)) { bmp.recycle(); noData[name] = true; return@withContext null }
             f.writeBytes(bytes)
             bmp
         } catch (e: Exception) {
@@ -899,9 +1000,58 @@ object Sat {
         }
     }
 
+    /**
+     * Finds the newest picture one of NASA's satellites has, by asking for one tile at recent times.
+     * Asked again at most every 5 minutes.
+     */
+    suspend fun probeLatest(src: SatSource): Instant? = withContext(Dispatchers.IO) {
+        if (src.gibs == null) return@withContext null
+        val now = System.currentTimeMillis()
+        val last = gibsProbedAt[src.id]
+        if (last != null && now - last < 5 * 60_000L) return@withContext gibsLatest[src.id]
+        gibsProbedAt[src.id] = now
+        val x = (((src.lon + 180.0) / 360.0) * 4).toInt().coerceIn(0, 3)
+        var t = (now / 1000 - 15 * 60) / 600 * 600
+        val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+        for (step in 0 until 16) {
+            try {
+                val bytes = Net.getBytes(gibsUrl(src, Instant.ofEpochSecond(t), 2, x, 1), maxBytes = 2_000_000, timeoutMs = 10_000)
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                if (bmp != null) {
+                    val ok = hasPicture(bmp)
+                    bmp.recycle()
+                    if (ok) {
+                        gibsLatest[src.id] = Instant.ofEpochSecond(t)
+                        return@withContext gibsLatest[src.id]
+                    }
+                }
+            } catch (e: Exception) {
+                // "HTTP 404" means no picture at that time yet: try an earlier one. Anything else: no connection.
+                if (e.message?.startsWith("HTTP") != true) break
+            }
+            t -= 600
+        }
+        gibsLatest[src.id]
+    }
+
+    private fun hasPicture(b: Bitmap): Boolean {
+        val step = b.width / 8
+        if (step == 0) return false
+        var y = step / 2
+        while (y < b.height) {
+            var x = step / 2
+            while (x < b.width) {
+                if ((b.getPixel(x, y) ushr 24) > 128) return true
+                x += step
+            }
+            y += step
+        }
+        return false
+    }
+
     /** Finds which layer name the server uses for an overlay and returns that layer's colour key. */
     suspend fun resolve(o: Overlay): Bitmap? = withContext(Dispatchers.IO) {
-        if (o == Overlay.NONE || unavailable(o)) return@withContext null
+        if (o == Overlay.NONE) return@withContext null
         for (layer in candidates(o)) {
             val legend = try {
                 val bytes = Net.getBytes(
@@ -922,19 +1072,29 @@ object Sat {
     fun isResolved(o: Overlay): Boolean = resolved[o] != null
 
     /** An overlay tile (transparent where there is nothing to show) in the server's own colours. */
-    suspend fun loadOverlayTile(ctx: Context, o: Overlay, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
-        val layer = resolved[o] ?: return@withContext null
-        val f = File(cacheDir(ctx), "${o.key}_${time.epochSecond}_${z}_${x}_$y")
+    suspend fun loadOverlayTile(ctx: Context, o: Overlay, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
+        if (src.gibs != null) return@withContext null
+        val layers = if (src.id == 0) listOfNotNull(resolved[o]) else if ((westFails[o] ?: 0) > 5) emptyList() else o.west
+        val f = File(cacheDir(ctx), "${o.key}${src.id}_${time.epochSecond}_${z}_${x}_$y")
         try {
             val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
             if (f.exists() && f.length() > 60) {
                 val saved = BitmapFactory.decodeFile(f.absolutePath, opts)
                 if (saved != null) return@withContext saved
             }
-            val bytes = Net.getBytes(tileUrl(layer.replace(":", "%3A"), "image%2Fpng", time, true, z, x, y), maxBytes = 2_000_000)
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return@withContext null
-            f.writeBytes(bytes)
-            bmp
+            for (layer in layers) {
+                val bytes = try {
+                    Net.getBytes(wmsTileUrl(layer.replace(":", "%3A"), "image%2Fpng", time, true, z, x, y), maxBytes = 2_000_000)
+                } catch (e: Exception) {
+                    continue
+                }
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: continue
+                if (src.id != 0) westFails[o] = 0
+                f.writeBytes(bytes)
+                return@withContext bmp
+            }
+            if (src.id != 0) westFails[o] = (westFails[o] ?: 0) + 1
+            null
         } catch (e: Exception) {
             null
         }
@@ -1020,6 +1180,44 @@ object Sat {
         Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
     }
 
+    /**
+     * Makes a NASA tile match the rest of the map: its grey (warmer) parts go through [lut] like any other cloud,
+     * and its coloured (cold-top) parts keep NASA's colours, or turn white when colour is off.
+     */
+    suspend fun styleGibs(raw: Bitmap, lut: IntArray, colour: Boolean): Bitmap = withContext(Dispatchers.Default) {
+        val w = raw.width
+        val h = raw.height
+        val px = IntArray(w * h)
+        raw.getPixels(px, 0, w, 0, 0, w, h)
+        val white = lut[235]
+        for (i in px.indices) {
+            val p = px[i]
+            if ((p ushr 24) < 128) { px[i] = 0; continue }
+            val r = p shr 16 and 0xFF
+            val g = p shr 8 and 0xFF
+            val b = p and 0xFF
+            val mx = maxOf(r, g, b)
+            val mn = minOf(r, g, b)
+            px[i] = if (mx - mn < 28) lut[(r * 3 + g * 6 + b) / 10]
+            else if (colour) (0xEE shl 24) or (p and 0xFFFFFF)
+            else white
+        }
+        Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+    }
+
+    /** Removes the palest (lightest-rain) colours from a rain tile. */
+    suspend fun hideLightRain(raw: Bitmap): Bitmap = withContext(Dispatchers.Default) {
+        val w = raw.width
+        val h = raw.height
+        val px = IntArray(w * h)
+        raw.getPixels(px, 0, w, 0, 0, w, h)
+        for (i in px.indices) {
+            val p = px[i]
+            if ((p ushr 24) < 40 || ((p shr 16 and 0xFF) > 215 && (p shr 8 and 0xFF) > 235)) px[i] = 0
+        }
+        Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+    }
+
     // ---- cloud top height
 
     private const val TOPS_MIN_M = 320.0
@@ -1099,12 +1297,17 @@ object Sat {
         table
     }
 
-    /** Recolours a cloud-top-height tile: tops below [fromFl] disappear, higher tops run yellow to white. */
-    suspend fun recolourTops(src: Bitmap, table: ByteArray, fromFl: Int): Bitmap = withContext(Dispatchers.Default) {
+    /**
+     * Recolours a cloud-top-height tile. A top is shown only when it is above [fromFl] and the infrared picture
+     * ([grey], same tile) is at least [minBright] there: thick, very cold cloud. Thin high cloud lets warmth
+     * through, looks darker on infrared, and is left out.
+     */
+    suspend fun recolourTops(src: Bitmap, table: ByteArray, fromFl: Int, grey: Bitmap, minBright: Int): Bitmap = withContext(Dispatchers.Default) {
         val w = src.width
         val h = src.height
         val px = IntArray(w * h)
         src.getPixels(px, 0, w, 0, 0, w, h)
+        val mask = if (grey.width == w && grey.height == h) IntArray(w * h).also { grey.getPixels(it, 0, w, 0, 0, w, h) } else null
         val fromFt = fromFl * 100.0
         val scale = Upper.TOPS_SCALE
         // Colour for each of the 256 table steps, worked out once.
@@ -1118,7 +1321,7 @@ object Sat {
         }
         for (i in px.indices) {
             val p = px[i]
-            if ((p ushr 24) < 60) { px[i] = 0; continue }
+            if ((p ushr 24) < 60 || (mask != null && (mask[i] shr 8 and 0xFF) < minBright)) { px[i] = 0; continue }
             val idx = ((p shr 19 and 31) shl 10) or ((p shr 11 and 31) shl 5) or (p shr 3 and 31)
             px[i] = out[table[idx].toInt() and 0xFF]
         }

@@ -323,11 +323,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var satLoading by mutableStateOf(false)
         private set
-    var satLoaded by mutableStateOf(0)
-        private set
-    var satTotal by mutableStateOf(0)
-        private set
     var satError by mutableStateOf<String?>(null)
+        private set
+    /** When a newer picture last joined the loop (0 = not yet). */
+    var satNewAt by mutableStateOf(0L)
         private set
     var enhanced by mutableStateOf(store.enhanced)
         private set
@@ -345,8 +344,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var topsFl by mutableStateOf(store.topsFl.coerceIn(150, 400))
         private set
+    var showLightRain by mutableStateOf(store.showLightRain)
+        private set
+    var cacheMb by mutableStateOf(-1)
+        private set
 
-    private var satJob: Job? = null
+    private class SatItem(val frame: Instant, val z: Int, val x: Int, val y: Int, val key: Long)
+
+    private val pending = ArrayDeque<SatItem>()
+    private val inFlight = HashSet<Long>()
+    private var workers = 0
+    private var prepJob: Job? = null
     private var satWanted: TileRange? = null
     private var satLoop = true
     private var styleGen = 0
@@ -374,118 +382,211 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun updateShowSigmet(v: Boolean) { showSigmet = v; store.showSigmet = v; if (v) loadSigmets() }
     fun updateLoopHours(h: Int) { if (h != loopHours) { loopHours = h; store.loopHours = h; reloadSat() } }
     fun previewSensitivity(v: Float) { sensitivity = v }
-    fun commitSensitivity() { store.sensitivity = sensitivity; if (enhanced) restyle() }
+    fun commitSensitivity() { store.sensitivity = sensitivity; restyle() }
     fun previewTopsFl(v: Int) { topsFl = v }
     fun commitTopsFl() { store.topsFl = topsFl; if (overlay == Overlay.TOPS) restyle() }
+    fun updateShowLightRain(v: Boolean) { showLightRain = v; store.showLightRain = v; if (overlay == Overlay.RAIN) restyle() }
 
+    fun refreshCacheSize() {
+        viewModelScope.launch { cacheMb = Sat.cacheMb(getApplication()) }
+    }
+
+    fun clearCache() {
+        viewModelScope.launch {
+            Sat.clearCache(getApplication())
+            windGrid = null
+            iceGrid = null
+            cacheMb = Sat.cacheMb(getApplication())
+            restyle()
+            ensureGrid()
+        }
+    }
+
+    /** The refresh button: failed tiles are tried again. */
     fun reloadSat() {
+        val r = satWanted ?: return
+        SatMem.failed.clear()
+        SatMem.empty.clear()
+        SatMem.tick++
+        satWant(r, satLoop, force = true)
+    }
+
+    /** Looks for a newer picture. Everything already held is kept, so only the new frame is downloaded. */
+    fun checkSatUpdate() {
         val r = satWanted ?: return
         satWant(r, satLoop, force = true)
     }
 
-    /** Fetches the new picture when the satellite has one newer than the newest held. */
-    fun checkSatUpdate() {
-        if (satWanted == null) return
-        viewModelScope.launch {
-            val latest = Sat.latestTime()
-            val shown = satTimes.lastOrNull()
-            if (shown == null || latest.isAfter(shown)) reloadSat()
+    private fun overlayReady(): Boolean =
+        overlay != Overlay.NONE && Sat.isResolved(overlay) && (overlay != Overlay.TOPS || topsTable != null)
+
+    /** The work key of a tile of a frame if anything for it still has to be loaded, else null. */
+    private fun needsWork(frame: Instant, z: Int, x: Int, y: Int): Long? {
+        val src = Sat.sourceFor(z, x)
+        val t = Sat.timeFor(src, frame) ?: return null
+        val key = SatMem.key(0, t, z, x, y)
+        if (key in inFlight) return null
+        val failedAt = SatMem.failed[key]
+        val irNeed = SatMem.mem.get(key) == null && (failedAt == null || System.currentTimeMillis() - failedAt > 60_000L)
+        val oKey = SatMem.key(1, t, z, x, y)
+        val ovNeed = src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && oKey !in SatMem.empty
+        return if (irNeed || ovNeed) key else null
+    }
+
+    /** Lists what is still missing for the view: newest frame first, from the middle of the screen outwards. */
+    private fun rebuildQueue() {
+        val r = satWanted ?: return
+        pending.clear()
+        val midX = (r.x0 + r.x1) / 2.0
+        val midY = (r.y0 + r.y1) / 2.0
+        val tiles = ArrayList<IntArray>()
+        for (y in r.y0..r.y1) for (x in r.x0..r.x1) tiles += intArrayOf(x, y)
+        tiles.sortBy { (it[0] - midX) * (it[0] - midX) + (it[1] - midY) * (it[1] - midY) }
+        val seen = HashSet<Long>()
+        for (t in satTimes.reversed()) {
+            for (tile in tiles) {
+                val key = needsWork(t, r.z, tile[0], tile[1]) ?: continue
+                if (seen.add(key)) pending.addLast(SatItem(t, r.z, tile[0], tile[1], key))
+            }
         }
     }
 
+    /** Starts downloads for the queue, six at a time. A download that has started always finishes. */
+    private fun pump() {
+        while (workers < 6 && pending.isNotEmpty()) {
+            workers++
+            satLoading = true
+            viewModelScope.launch {
+                try {
+                    while (true) {
+                        val item = pending.removeFirstOrNull() ?: break
+                        if (!inFlight.add(item.key)) continue
+                        try {
+                            loadTile(item)
+                        } finally {
+                            inFlight.remove(item.key)
+                        }
+                    }
+                } finally {
+                    workers--
+                    if (workers == 0) {
+                        // Anything dropped along the way (a colour change mid-download) is picked up again.
+                        rebuildQueue()
+                        if (pending.isNotEmpty()) pump() else {
+                            satLoading = false
+                            if (SatMem.mem.size() == 0 && satTimes.isNotEmpty()) {
+                                satError = "No satellite images for this area. Check your connection, or move the map."
+                            }
+                            viewModelScope.launch { runCatching { Sat.trimCache(getApplication()) } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun loadTile(item: SatItem) {
+        val ctx = getApplication<Application>()
+        val gen = styleGen
+        val kind = overlay
+        // With rain or tops on, the cloud underneath is plain grey so only one set of colours is on the map.
+        val colour = enhanced && kind == Overlay.NONE
+        val lut = Sat.buildLut(sensitivity, colour)
+        val src = Sat.sourceFor(item.z, item.x)
+        val t = Sat.timeFor(src, item.frame) ?: return
+        val key = SatMem.key(0, t, item.z, item.x, item.y)
+        val oKey = SatMem.key(1, t, item.z, item.x, item.y)
+        val irNeed = SatMem.mem.get(key) == null
+        val ovNeed = src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && oKey !in SatMem.empty
+        if (!irNeed && !ovNeed) return
+
+        if (src.gibs != null) {
+            val raw = Sat.loadGibsTile(ctx, src, t, item.z, item.x, item.y)
+            if (raw != null) {
+                val bmp = Sat.styleGibs(raw, lut, colour)
+                raw.recycle()
+                if (gen == styleGen) { SatMem.mem.put(key, bmp.asImageBitmap()); SatMem.tick++; satError = null }
+            } else if (gen == styleGen) SatMem.failed[key] = System.currentTimeMillis()
+            return
+        }
+
+        val grey = if (irNeed || (ovNeed && kind == Overlay.TOPS)) Sat.loadIrTile(ctx, src, t, item.z, item.x, item.y) else null
+        if (irNeed) {
+            if (grey != null) {
+                val bmp = Sat.colourise(grey, lut)
+                if (gen == styleGen) { SatMem.mem.put(key, bmp.asImageBitmap()); SatMem.tick++; satError = null }
+            } else if (gen == styleGen) SatMem.failed[key] = System.currentTimeMillis()
+        }
+        if (ovNeed) {
+            val raw = Sat.loadOverlayTile(ctx, kind, src, t, item.z, item.x, item.y)
+            val table = topsTable
+            val out: Bitmap? = when {
+                raw == null -> null
+                kind == Overlay.TOPS -> {
+                    if (grey != null && table != null) {
+                        val start = Sat.threshold(sensitivity)
+                        Sat.recolourTops(raw, table, topsFl, grey, start + (255 - start) / 2).also { raw.recycle() }
+                    } else { raw.recycle(); null }
+                }
+                kind == Overlay.RAIN && !showLightRain -> Sat.hideLightRain(raw).also { raw.recycle() }
+                else -> raw
+            }
+            if (gen == styleGen) {
+                if (out != null) SatMem.mem.put(oKey, out.asImageBitmap()) else SatMem.empty.add(oKey)
+                SatMem.tick++
+            }
+        }
+        grey?.recycle()
+    }
+
     /**
-     * Loads the satellite tiles the map needs. Tiles already in memory are skipped, the newest frame is
-     * fetched first from the middle of the screen outwards, and the older loop frames fill in behind it.
+     * Tells the loader which satellite tiles the map needs. Tiles already held are kept; only what is missing
+     * is queued. Called again with [force] to look for a newer picture.
      */
     internal fun satWant(r: TileRange, loop: Boolean, force: Boolean = false) {
         if (!force && r == satWanted && loop == satLoop) return
         satWanted = r
         satLoop = loop
-        satJob?.cancel()
-        val ctx = getApplication<Application>()
-        val gen = styleGen
-        val kind = overlay
-        val lut = Sat.buildLut(sensitivity, enhanced && kind != Overlay.TOPS)
-        val fromFl = topsFl
-        satJob = viewModelScope.launch {
-            satLoading = true
-            satError = null
-            try {
-                val latest = Sat.latestTime()
-                val times = if (loop) Sat.frameTimes(latest, loopHours) else listOf(latest)
-                if (times != satTimes) satTimes = times
-
-                // The overlay's layer name and colour key are looked up once.
-                var table: ByteArray? = null
-                if (kind != Overlay.NONE) {
-                    if (!Sat.isResolved(kind) || (kind == Overlay.RAIN && overlayLegend == null) || (kind == Overlay.TOPS && topsTable == null)) {
-                        val legend = Sat.resolve(kind)
-                        if (kind == Overlay.RAIN && legend != null) overlayLegend = legend
-                        if (kind == Overlay.TOPS && Sat.isResolved(kind)) topsTable = Sat.buildTopsTable(legend)
-                    }
-                    overlayMissing = Sat.unavailable(kind) || !Sat.isResolved(kind)
-                    table = topsTable
-                }
-                val withOverlay = kind != Overlay.NONE && Sat.isResolved(kind) && (kind != Overlay.TOPS || table != null)
-
-                val midX = (r.x0 + r.x1) / 2.0
-                val midY = (r.y0 + r.y1) / 2.0
-                val tiles = ArrayList<IntArray>()
-                for (y in r.y0..r.y1) for (x in r.x0..r.x1) tiles += intArrayOf(x, y)
-                tiles.sortBy { (it[0] - midX) * (it[0] - midX) + (it[1] - midY) * (it[1] - midY) }
-
-                satTotal = times.size * tiles.size
-                satLoaded = 0
-                var got = 0
-                val gate = Semaphore(6)
-                coroutineScope {
-                    for (t in times.reversed()) {
-                        for (tile in tiles) {
-                            val x = tile[0]
-                            val y = tile[1]
-                            val key = SatMem.key(0, t, r.z, x, y)
-                            val oKey = SatMem.key(1, t, r.z, x, y)
-                            val haveIr = SatMem.mem.get(key) != null
-                            val haveOv = !withOverlay || SatMem.mem.get(oKey) != null
-                            if (haveIr && haveOv) { satLoaded++; got++; continue }
-                            launch {
-                                gate.withPermit {
-                                    if (!haveIr) {
-                                        val grey = Sat.loadIrTile(ctx, t, r.z, x, y)
-                                        if (grey != null) {
-                                            val bmp = Sat.colourise(grey, lut)
-                                            grey.recycle()
-                                            if (gen == styleGen) {
-                                                SatMem.mem.put(key, bmp.asImageBitmap())
-                                                SatMem.tick++
-                                                got++
-                                            }
-                                        }
-                                    }
-                                    if (!haveOv) {
-                                        val raw = Sat.loadOverlayTile(ctx, kind, t, r.z, x, y)
-                                        if (raw != null) {
-                                            val out = if (kind == Overlay.TOPS && table != null) {
-                                                Sat.recolourTops(raw, table, fromFl).also { raw.recycle() }
-                                            } else raw
-                                            if (gen == styleGen) {
-                                                SatMem.mem.put(oKey, out.asImageBitmap())
-                                                SatMem.tick++
-                                            }
-                                        }
-                                    }
-                                    satLoaded++
-                                }
-                            }
-                        }
-                    }
-                }
-                if (got == 0) satError = "No satellite images for this area. Check your connection, or move the map."
-                Sat.trimCache(ctx)
-            } finally {
-                // A newer load may already have replaced this one; only the current load clears the flag.
-                if (satJob === coroutineContext[Job]) satLoading = false
+        prepJob?.cancel()
+        prepJob = viewModelScope.launch {
+            if (satTimes.isEmpty()) satLoading = true
+            val latest = Sat.latestTime()
+            val times = if (loop) Sat.frameTimes(latest, loopHours) else listOf(latest)
+            if (times != satTimes) {
+                val old = satTimes.lastOrNull()
+                if (old != null && latest.isAfter(old)) satNewAt = System.currentTimeMillis()
+                satTimes = times
             }
+            rebuildQueue()
+            pump()
+
+            // The overlay's layer name and colour key are looked up once.
+            val kind = overlay
+            if (kind != Overlay.NONE &&
+                (!Sat.isResolved(kind) || (kind == Overlay.RAIN && overlayLegend == null) || (kind == Overlay.TOPS && topsTable == null))
+            ) {
+                val legend = Sat.resolve(kind)
+                if (kind == Overlay.RAIN && legend != null) overlayLegend = legend
+                if (kind == Overlay.TOPS && Sat.isResolved(kind)) topsTable = Sat.buildTopsTable(legend)
+                overlayMissing = !Sat.isResolved(kind)
+                rebuildQueue()
+                pump()
+            }
+
+            // NASA's satellites: find their newest picture, then queue their tiles.
+            for (src in Sat.sourcesIn(r.z, r.x0, r.x1)) {
+                if (src.gibs == null) continue
+                launch {
+                    val before = Sat.latestOf(src)
+                    val found = Sat.probeLatest(src)
+                    if (found != null && found != before) {
+                        SatMem.tick++
+                        rebuildQueue()
+                        pump()
+                    }
+                }
+            }
+            if (workers == 0 && pending.isEmpty()) satLoading = false
         }
     }
 

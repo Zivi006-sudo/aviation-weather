@@ -55,16 +55,27 @@ internal class MapCam(cx: Double, cy: Double, scale: Double, private val spanDeg
     var scale by mutableDoubleStateOf(scale)
     var size by mutableStateOf(IntSize.Zero)
 
+    /** Height in pixels of the controls lying over the top and bottom of the map. */
+    var padTop = 0
+    var padBottom = 0
+
+    /** False until the user pans or zooms; until then the view keeps itself framed on the Maldives. */
+    var moved = scale > 0.0
+
     fun onSize(s: IntSize) {
         size = s
-        if (scale <= 0.0 && s.height > 0) scale = s.height * 360.0 / spanDeg
+        if (!moved) home()
     }
 
-    /** Back to the whole-Maldives view. */
+    /** The whole of the Maldives, centred in the part of the map that no control covers. */
     fun home() {
+        moved = false
+        val h = size.height
+        if (h <= 0) return
+        val clear = (h - padTop - padBottom).coerceAtLeast(h / 3)
+        scale = clear * 360.0 / spanDeg
         cx = Merc.x(HOME_LON)
-        cy = Merc.y(HOME_LAT)
-        if (size.height > 0) scale = size.height * 360.0 / spanDeg
+        cy = Merc.y(HOME_LAT) - (padTop - padBottom) / 2.0 / scale
     }
 
     companion object {
@@ -84,6 +95,7 @@ internal fun Modifier.mapCamera(cam: MapCam, maxScale: Double = 256.0 * 5800.0):
                 val h = size.height.toDouble()
                 val scale = cam.scale
                 if (scale > 0.0) {
+                    cam.moved = true
                     val minScale = maxOf(w, h) * 1.2
                     val newScale = (scale * zoom).coerceIn(minScale, maxScale)
                     // Keep the point under the fingers fixed while zooming.

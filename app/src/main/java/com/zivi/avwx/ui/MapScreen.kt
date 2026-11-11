@@ -69,6 +69,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
@@ -122,7 +123,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
             while (true) {
                 vm.checkSatUpdate()
                 if (vm.showSigmet) vm.loadSigmets()
-                delay(3 * 60_000L)
+                delay(2 * 60_000L)
             }
         }
     }
@@ -132,7 +133,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     LaunchedEffect(cam) {
         snapshotFlow { satR }.collectLatest { r ->
             if (r != null) {
-                delay(120)
+                delay(300)
                 vm.satWant(r, loop = true)
             }
         }
@@ -150,10 +151,21 @@ fun MapScreen(vm: AppViewModel, now: Long) {
         }
     }
 
-    // New set of frames: stay where the loop is if it is playing, otherwise show the newest.
+    // The loop moved on by a frame: keep showing the same picture, or the newest if that was on screen.
+    val prevTimes = remember { arrayOf<List<Instant>>(emptyList()) }
     LaunchedEffect(times) {
+        val old = prevTimes[0]
+        prevTimes[0] = times
         val last = (times.size - 1).coerceAtLeast(0).toFloat()
-        pos.floatValue = if (playing) pos.floatValue.coerceAtMost(last) else last
+        val p = pos.floatValue
+        pos.floatValue = when {
+            playing -> p.coerceAtMost(last)
+            old.isEmpty() || p >= old.size - 1 -> last
+            else -> {
+                val i = times.indexOf(old[p.roundToInt().coerceIn(0, old.size - 1)])
+                if (i >= 0) i.toFloat() else last
+            }
+        }
     }
 
     // Animation clock, tied to the display refresh rate.
@@ -302,7 +314,10 @@ fun MapScreen(vm: AppViewModel, now: Long) {
         }
 
         // ---- top controls
-        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(
+            Modifier.fillMaxWidth().onSizeChanged { cam.padTop = it.height; if (!cam.moved) cam.home() }.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Segmented(
                     options = listOf("Colour", "IR"),
@@ -354,7 +369,11 @@ fun MapScreen(vm: AppViewModel, now: Long) {
         }
 
         // ---- bottom panels: forecast controls, then the satellite timeline with its colour keys
-        Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
+        Column(
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                .onSizeChanged { cam.padBottom = it.height; if (!cam.moved) cam.home() }
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+        ) {
             if (gridOn) {
                 ForecastPanel(vm, vm.windGrid, vm.iceGrid, windIdx, iceIdx, tip)
                 Spacer(Modifier.height(6.dp))
@@ -376,17 +395,25 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     }
 }
 
-/** The time read-out, play controls, slider and colour keys. The only part of the screen rebuilt while the loop plays. */
+/** The time read-out, play controls, slider and colour key. The only part of the screen rebuilt while the loop plays. */
 @Composable
 private fun Timeline(
     vm: AppViewModel, times: List<Instant>, pos: MutableFloatState, playing: Boolean, speedIdx: Int, now: Long,
     onPlayPause: () -> Unit, onSpeed: () -> Unit, onScrub: (Float) -> Unit,
 ) {
+    var flash by remember { mutableStateOf(false) }
+    LaunchedEffect(vm.satNewAt) {
+        if (vm.satNewAt > 0L) {
+            flash = true
+            delay(8000)
+            flash = false
+        }
+    }
     Column(
         Modifier
             .fillMaxWidth()
             .background(PANEL, RoundedCornerShape(20.dp))
-            .padding(horizontal = 14.dp, vertical = 10.dp)
+            .padding(horizontal = 14.dp, vertical = 8.dp)
     ) {
         if (times.isEmpty()) {
             val err = vm.satError
@@ -409,16 +436,17 @@ private fun Timeline(
                 Column(Modifier.weight(1f)) {
                     Text(
                         Fmt.zulu(shown) + "  /  " + Fmt.local(shown) + " LT",
-                        fontSize = 20.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
+                        fontSize = 18.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace,
                         color = Color.White,
                     )
-                    val loading = vm.satLoading && vm.satTotal > 0 && vm.satLoaded < vm.satTotal
                     Text(
-                        (if (nearest == lastIdx) "Latest image" else "Latest image: " + Fmt.zulu(newest)) +
-                            " · " + Fmt.ago(newest.toEpochMilli(), now) +
-                            (if (loading) " · loading ${vm.satLoaded * 100 / vm.satTotal}%" else ""),
-                        fontSize = 12.sp,
-                        color = if (ageMin > 45) Amber else MaterialTheme.colorScheme.onSurfaceVariant,
+                        if (flash) "New image " + Fmt.zulu(newest)
+                        else (if (nearest == lastIdx) "Latest image" else "Latest image: " + Fmt.zulu(newest)) +
+                            " · " + Fmt.ago(newest.toEpochMilli(), now),
+                        fontSize = 12.sp, maxLines = 1,
+                        fontWeight = if (flash) FontWeight.Bold else FontWeight.Normal,
+                        color = if (flash) MaterialTheme.colorScheme.primary
+                        else if (ageMin > 45) Amber else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 Text(
@@ -439,44 +467,39 @@ private fun Timeline(
                     onValueChangeFinished = { pos.floatValue = pos.floatValue.roundToInt().toFloat() },
                     valueRange = 0f..lastIdx.toFloat(),
                     steps = (times.size - 2).coerceAtLeast(0),
+                    modifier = Modifier.height(36.dp),
                 )
-                Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(Fmt.zulu(times.first()), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text("${times.size} images · every 15 min", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(Fmt.zulu(newest), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
             }
             val err = vm.satError
             if (err != null) {
-                Text(err, fontSize = 12.sp, color = Amber, modifier = Modifier.padding(top = 4.dp))
+                Text(err, fontSize = 12.sp, color = Amber, modifier = Modifier.padding(top = 2.dp))
             }
         }
 
-        // ---- colour keys, kept here so they never cover the map
-        Spacer(Modifier.height(8.dp))
+        // ---- one colour key at a time, kept here so it never covers the map
+        val legend = vm.overlayLegend
         if (vm.overlay == Overlay.TOPS) {
             val colours = remember { Upper.TOPS_SCALE.map { Color(0xFF000000.toInt() or it) } }
             KeyBar("Cloud tops", colours, "FL${vm.topsFl}", "FL500")
+        } else if (vm.overlay == Overlay.RAIN) {
+            if (legend != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Rain rate", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(64.dp))
+                    Image(
+                        bitmap = remember(legend) { legend.asImageBitmap() }, contentDescription = "Rain colour key",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.background(Color.White, RoundedCornerShape(4.dp)).padding(2.dp).heightIn(max = 40.dp).widthIn(max = 220.dp),
+                    )
+                }
+            }
         } else if (vm.enhanced) {
             val colours = remember { listOf(Color(0xFFC8C8C8)) + Sat.SCALE.map { Color(0xFF000000.toInt() or it) } }
             KeyBar("Cloud", colours, "low", "coldest tops / deep CB")
         }
-        val legend = vm.overlayLegend
-        if (vm.overlay == Overlay.RAIN && legend != null) {
-            Spacer(Modifier.height(6.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Rain rate", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(64.dp))
-                Image(
-                    bitmap = remember(legend) { legend.asImageBitmap() }, contentDescription = "Rain colour key",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.background(Color.White, RoundedCornerShape(4.dp)).padding(2.dp).heightIn(max = 44.dp).widthIn(max = 220.dp),
-                )
-            }
-        }
         Text(
-            "Map © OpenStreetMap contributors, CARTO · Satellite © EUMETSAT · Forecast: Open-Meteo",
-            fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 6.dp),
+            "Map © OpenStreetMap, CARTO · Satellite © EUMETSAT, NASA GIBS · Forecast: Open-Meteo",
+            fontSize = 8.sp, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp),
         )
     }
 }

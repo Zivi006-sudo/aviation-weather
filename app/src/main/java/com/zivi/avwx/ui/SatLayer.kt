@@ -27,13 +27,20 @@ internal object SatMem {
     val mem = object : LruCache<Long, ImageBitmap>(maxKb) {
         override fun sizeOf(key: Long, value: ImageBitmap): Int = value.width * value.height * 4 / 1024
     }
+    /** Cloud tiles that failed to load, with when, so they are not asked for again straight away. */
+    val failed = HashMap<Long, Long>()
+    /** Extra-layer tiles that were loaded and had nothing in them. */
+    val empty = HashSet<Long>()
     var tick by mutableIntStateOf(0)
 
+    /** [time] is the satellite's own picture time, so two loop frames showing the same picture share one tile. */
     fun key(kind: Int, time: Instant, z: Int, x: Int, y: Int): Long =
-        (kind.toLong() shl 44) or (((time.epochSecond / 900) and 0xFFFFF) shl 24) or (z.toLong() shl 16) or (x.toLong() shl 8) or y.toLong()
+        (kind.toLong() shl 44) or (((time.epochSecond / 300) and 0xFFFFF) shl 24) or (z.toLong() shl 16) or (x.toLong() shl 8) or y.toLong()
 
     fun clear() {
         mem.evictAll()
+        failed.clear()
+        empty.clear()
         tick++
     }
 }
@@ -76,37 +83,70 @@ internal class SatPlan(private val kind: Int) {
         times = t
         z = r.z
         val newest = t.lastOrNull()
-        frames = Array(t.size) { f ->
+        val complete = BooleanArray(t.size)
+        val built = Array(t.size) { f ->
             val list = ArrayList<SatPiece>()
+            var all = true
             for (y in r.y0..r.y1) {
                 for (x in r.x0..r.x1) {
-                    if (!place(list, t[f], r.z, x, y) && kind == 0 && newest != null && t[f] != newest) {
-                        place(list, newest, r.z, x, y)
-                    }
+                    var ok = place(list, t[f], r.z, x, y)
+                    // Cloud picture: a tile missing from an older frame borrows the newest frame's.
+                    if (!ok && kind == 0 && newest != null && t[f] != newest) ok = place(list, newest, r.z, x, y)
+                    if (!ok) all = false
                 }
             }
+            complete[f] = all
             list
         }
+        if (kind == 1) {
+            // Extra layers are shown a whole frame at a time: an unfinished frame shows the nearest finished one.
+            for (f in built.indices) {
+                if (complete[f]) continue
+                var pick = -1
+                var d = 1
+                while (pick < 0 && (f + d < built.size || f - d >= 0)) {
+                    if (f + d < built.size && complete[f + d]) pick = f + d
+                    else if (f - d >= 0 && complete[f - d]) pick = f - d
+                    d++
+                }
+                built[f] = if (pick >= 0) built[pick] else ArrayList()
+            }
+        }
+        frames = built
     }
 
-    private fun place(out: ArrayList<SatPiece>, time: Instant, z: Int, x: Int, y: Int): Boolean {
-        val own = SatMem.mem.get(SatMem.key(kind, time, z, x, y))
-        if (own != null) {
+    /** 0 = a picture is there (in [out]); 1 = known to have nothing; 2 = not loaded. */
+    private fun fetch(frame: Instant, z: Int, x: Int, y: Int): Any? {
+        val src = Sat.sourceFor(z, x)
+        if (kind == 1 && src.gibs != null) return EMPTY
+        val t = Sat.timeFor(src, frame) ?: return null
+        val k = SatMem.key(kind, t, z, x, y)
+        val img = SatMem.mem.get(k)
+        if (img != null) return img
+        return if (kind == 1 && k in SatMem.empty) EMPTY else null
+    }
+
+    private fun place(out: ArrayList<SatPiece>, frame: Instant, z: Int, x: Int, y: Int): Boolean {
+        val own = fetch(frame, z, x, y)
+        if (own is ImageBitmap) {
             out += SatPiece(own, 0, 0, own.width, x, y, 0f, 0f, 1f)
             return true
         }
+        if (own === EMPTY) return true
         // Finer tiles from a closer zoom, when all of them are there.
         for (d in 1..2) {
             if (z + d > Sat.MAX_ZOOM) break
             val k = 1 shl d
             val found = ArrayList<SatPiece>(k * k)
+            var have = 0
             for (j in 0 until k) {
                 for (i in 0 until k) {
-                    val child = SatMem.mem.get(SatMem.key(kind, time, z + d, x * k + i, y * k + j)) ?: continue
-                    found += SatPiece(child, 0, 0, child.width, x, y, i.toFloat() / k, j.toFloat() / k, 1f / k)
+                    val child = fetch(frame, z + d, x * k + i, y * k + j) ?: continue
+                    have++
+                    if (child is ImageBitmap) found += SatPiece(child, 0, 0, child.width, x, y, i.toFloat() / k, j.toFloat() / k, 1f / k)
                 }
             }
-            if (found.size == k * k) {
+            if (have == k * k) {
                 out += found
                 return true
             }
@@ -114,18 +154,20 @@ internal class SatPlan(private val kind: Int) {
         // A coarser tile from a wider zoom.
         for (up in 1..4) {
             if (z - up < 0) break
-            val parent = SatMem.mem.get(SatMem.key(kind, time, z - up, x shr up, y shr up)) ?: continue
-            val sub = parent.width shr up
-            if (sub < 1) break
-            out += SatPiece(parent, (x - ((x shr up) shl up)) * sub, (y - ((y shr up) shl up)) * sub, sub, x, y, 0f, 0f, 1f)
+            val parent = fetch(frame, z - up, x shr up, y shr up) ?: continue
+            if (parent is ImageBitmap) {
+                val sub = parent.width shr up
+                if (sub < 1) break
+                out += SatPiece(parent, (x - ((x shr up) shl up)) * sub, (y - ((y shr up) shl up)) * sub, sub, x, y, 0f, 0f, 1f)
+            }
             return true
         }
-        // Some of the finer tiles are better than a hole.
-        if (z + 1 <= Sat.MAX_ZOOM) {
+        // Cloud picture only: some of the finer tiles are better than a hole.
+        if (kind == 0 && z + 1 <= Sat.MAX_ZOOM) {
             var any = false
             for (j in 0..1) {
                 for (i in 0..1) {
-                    val child = SatMem.mem.get(SatMem.key(kind, time, z + 1, x * 2 + i, y * 2 + j)) ?: continue
+                    val child = fetch(frame, z + 1, x * 2 + i, y * 2 + j) as? ImageBitmap ?: continue
                     out += SatPiece(child, 0, 0, child.width, x, y, i / 2f, j / 2f, 0.5f)
                     any = true
                 }
@@ -133,6 +175,10 @@ internal class SatPlan(private val kind: Int) {
             if (any) return true
         }
         return false
+    }
+
+    private companion object {
+        val EMPTY = Any()
     }
 }
 

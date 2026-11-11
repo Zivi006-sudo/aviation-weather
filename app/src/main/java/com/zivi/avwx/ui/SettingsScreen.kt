@@ -20,6 +20,10 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -114,6 +118,29 @@ fun SettingsScreen(vm: AppViewModel) {
                     "Shows wind as arrows with speeds instead of moving lines.",
                     vm.windAsArrows,
                 ) { vm.updateWindAsArrows(it) }
+                Spacer(Modifier.height(10.dp))
+                SwitchRow(
+                    "Show light rain",
+                    "The Rain layer normally leaves out its faintest band, which covers most cloud. Turn on to see all of it.",
+                    vm.showLightRain,
+                ) { vm.updateShowLightRain(it) }
+            }
+
+            Section("Storage") {
+                LaunchedEffect(Unit) { vm.refreshCacheSize() }
+                Text(
+                    if (vm.cacheMb >= 0) "Saved satellite and forecast data: ${vm.cacheMb} MB" else "Saved satellite and forecast data",
+                    fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    "Satellite pictures are kept for 8 hours so places you have looked at reappear at once. They are removed automatically after that.",
+                    fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Clear now", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clip(RoundedCornerShape(10.dp)).clickable { vm.clearCache() }.padding(horizontal = 4.dp, vertical = 8.dp),
+                )
             }
 
             Section("Data sources") {
@@ -121,7 +148,8 @@ fun SettingsScreen(vm: AppViewModel) {
                     "METAR and TAF: Aviation Weather Center (aviationweather.gov) and the Maldives Meteorological Service " +
                         "aviation page; the newer report for each airport is shown.\n" +
                         "SIGMET: Aviation Weather Center.\n" +
-                        "Satellite, rain rate and cloud top height: EUMETSAT Meteosat, Indian Ocean coverage, every 15 minutes.\n" +
+                        "Satellite: EUMETSAT Meteosat (Indian Ocean, Africa and Europe) every 15 minutes; NASA GIBS (GOES-East, GOES-West, Himawari) elsewhere, every 10 minutes.\n" +
+                        "Rain rate and cloud top height: EUMETSAT, in the Meteosat areas only.\n" +
                         "Wind, freezing level, icing, turbulence and thunderstorm risk: Open-Meteo model forecast.\n" +
                         "Live traffic: airplanes.live and adsb.lol community receivers. Aircraft outside their coverage are not shown.\n" +
                         "Radar imagery: Sentinel-2 cloudless by EOX IT Services GmbH (contains modified Copernicus Sentinel data 2024).\n" +
