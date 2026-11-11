@@ -915,8 +915,7 @@ object Sat {
             resolved[o] = layer
             return@withContext legend
         }
-        // Only called a failure when the server answered the layer list but none of the names worked.
-        if (serverLayers != null) missing[o] = true
+        // Not remembered as a failure: a dropped connection looks the same, so the next load tries again.
         null
     }
 
