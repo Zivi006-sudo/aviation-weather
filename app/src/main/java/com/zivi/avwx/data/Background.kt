@@ -79,12 +79,6 @@ class WxWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, pa
     override suspend fun doWork(): Result {
         val ctx = applicationContext
         val store = Store(ctx)
-        // Pictures and forecasts for the Maldives, so the map is ready when the app opens.
-        try {
-            Prefetch.run(ctx, store)
-        } catch (t: Throwable) {
-            if (t is kotlinx.coroutines.CancellationException) throw t
-        }
         val airports = store.loadAirports()
         if (airports.isEmpty()) return Result.success()
         val old = store.loadWx()

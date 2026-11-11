@@ -13,7 +13,6 @@ import com.zivi.avwx.data.ExtraApi
 import com.zivi.avwx.data.Overlay
 import com.zivi.avwx.data.FcGrid
 import com.zivi.avwx.data.GridKind
-import com.zivi.avwx.data.Prefetch
 import com.zivi.avwx.wx.Upper
 import androidx.compose.ui.graphics.asImageBitmap
 import com.zivi.avwx.data.WxMerge
@@ -51,23 +50,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         WxWorker.schedule(app)
-        store.lastOpened = System.currentTimeMillis()
         viewModelScope.launch { runCatching { Tiles.trim(app) } }
-        // While the app is open (or minimized but still running), the newest pictures for the Maldives
-        // are downloaded as they come out, so opening the Satellite tab is quick.
-        viewModelScope.launch {
-            delay(30_000)
-            while (true) {
-                try {
-                    Prefetch.run(app, store)
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    // Try again next time.
-                }
-                delay(5 * 60_000L)
-            }
-        }
     }
 
     // ------------------------------------------------------------ airports + weather
@@ -378,11 +361,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Times of the loop frames, oldest first. */
     var satTimes by mutableStateOf<List<Instant>>(emptyList())
         private set
-    /** True while the newest picture for the view is still loading. */
     var satLoading by mutableStateOf(false)
-        private set
-    /** How far the older loop frames have filled in (0..1), or -1 when nothing is loading. */
-    var satProgress by mutableStateOf(-1f)
         private set
     var satError by mutableStateOf<String?>(null)
         private set
@@ -413,56 +392,45 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var cacheMb by mutableStateOf(-1)
         private set
 
-    /** Which kind of cloud picture is on screen: colour, or plain grey (IR mode, and under rain or tops). */
-    val cloudKind: Int get() = if (enhanced && overlay == Overlay.NONE) SatMem.COLOUR else SatMem.GREY
-    /** Which kind of extra layer is on screen, or -1. */
-    val overlayKind: Int get() = when (overlay) { Overlay.RAIN -> SatMem.RAIN; Overlay.TOPS -> SatMem.TOPS; else -> -1 }
-
     private class SatItem(val frame: Instant, val z: Int, val x: Int, val y: Int, val key: Long)
 
     private val pending = ArrayDeque<SatItem>()
-    private val inFlight = HashMap<Long, Instant>()
+    private val inFlight = HashSet<Long>()
     private var workers = 0
-    private var queueTotal = 0
     private var prepJob: Job? = null
-    private var satWanted: SatView? = null
+    private var satWanted: TileRange? = null
     private var satLoop = true
     private var styleGen = 0
     private var topsTable: ByteArray? = null
-    private val legends = HashMap<Overlay, Bitmap>()
 
-    /** Colour settings changed: the affected kinds are rebuilt from the copies saved on the phone. */
-    private fun restyle(vararg kinds: Int) {
+    /** How many loop frames the current setting gives. */
+    val loopFrames: Int get() = loopHours * 4 + 1
+
+    /** Colours or layers changed: tiles in memory are redrawn from the copies saved on the phone. */
+    private fun restyle() {
         styleGen++
-        SatMem.clearKinds(*kinds)
+        SatMem.clear()
         reloadSat()
     }
 
-    /** Layers switched: tiles already in memory stay; only what is missing is loaded. */
-    private fun switched() {
-        SatMem.tick++
-        val v = satWanted ?: return
-        satWant(v, satLoop, force = true)
-    }
-
-    fun updateEnhanced(v: Boolean) { if (v != enhanced) { enhanced = v; store.enhanced = v; switched() } }
+    fun updateEnhanced(v: Boolean) { if (v != enhanced) { enhanced = v; store.enhanced = v; restyle() } }
     fun updateOverlay(o: Overlay) {
         if (o == overlay) return
         overlay = o
         store.overlay = o.key
         Sat.activeOverlay = o
         overlayTo = Sat.overlayLatest(o)
-        overlayLegend = legends[o]
+        overlayLegend = null
         overlayMissing = false
-        switched()
+        restyle()
     }
     fun updateShowSigmet(v: Boolean) { showSigmet = v; store.showSigmet = v; if (v) loadSigmets() }
     fun updateLoopHours(h: Int) { if (h != loopHours) { loopHours = h; store.loopHours = h; reloadSat() } }
     fun previewSensitivity(v: Float) { sensitivity = v }
-    fun commitSensitivity() { store.sensitivity = sensitivity; restyle(SatMem.COLOUR, SatMem.TOPS) }
+    fun commitSensitivity() { store.sensitivity = sensitivity; restyle() }
     fun previewTopsFl(v: Int) { topsFl = v }
-    fun commitTopsFl() { store.topsFl = topsFl; restyle(SatMem.TOPS) }
-    fun updateShowLightRain(v: Boolean) { showLightRain = v; store.showLightRain = v; restyle(SatMem.RAIN) }
+    fun commitTopsFl() { store.topsFl = topsFl; if (overlay == Overlay.TOPS) restyle() }
+    fun updateShowLightRain(v: Boolean) { showLightRain = v; store.showLightRain = v; if (overlay == Overlay.RAIN) restyle() }
 
     fun refreshCacheSize() {
         viewModelScope.launch { cacheMb = Sat.cacheMb(getApplication()) }
@@ -473,28 +441,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             Sat.clearCache(getApplication())
             windGrid = null
             iceGrid = null
-            gridCache.clear()
             cacheMb = Sat.cacheMb(getApplication())
-            styleGen++
-            SatMem.clear()
-            reloadSat()
+            restyle()
             ensureGrid()
         }
     }
 
     /** The refresh button: failed tiles are tried again. */
     fun reloadSat() {
-        val v = satWanted ?: return
+        val r = satWanted ?: return
         SatMem.failed.clear()
         SatMem.empty.clear()
         SatMem.tick++
-        satWant(v, satLoop, force = true)
+        satWant(r, satLoop, force = true)
     }
 
     /** Looks for a newer picture. Everything already held is kept, so only the new frame is downloaded. */
     fun checkSatUpdate() {
-        val v = satWanted ?: return
-        satWant(v, satLoop, force = true)
+        val r = satWanted ?: return
+        satWant(r, satLoop, force = true)
     }
 
     private fun overlayReady(): Boolean =
@@ -504,58 +469,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun needsWork(frame: Instant, z: Int, x: Int, y: Int): Long? {
         val src = Sat.sourceFor(z, x)
         val t = Sat.timeFor(src, frame) ?: return null
-        val key = SatMem.key(SatMem.GREY, t, z, x, y)
+        val key = SatMem.key(0, t, z, x, y)
         if (key in inFlight) return null
         val failedAt = SatMem.failed[key]
-        val cloudMissing = SatMem.mem.get(key) == null || SatMem.mem.get(SatMem.key(SatMem.COLOUR, t, z, x, y)) == null
-        val irNeed = cloudMissing && (failedAt == null || System.currentTimeMillis() - failedAt > 20_000L)
-        val ok = overlayKind
-        val ovNeed = ok >= 0 && src.gibs == null && overlayReady() && run {
-            val oKey = SatMem.key(ok, Sat.overlayTime(frame), z, x, y)
-            SatMem.mem.get(oKey) == null && !SatMem.isEmpty(oKey)
-        }
+        val irNeed = SatMem.mem.get(key) == null && (failedAt == null || System.currentTimeMillis() - failedAt > 60_000L)
+        val oKey = SatMem.key(1, Sat.overlayTime(frame), z, x, y)
+        val ovNeed = src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && !SatMem.isEmpty(oKey)
         return if (irNeed || ovNeed) key else null
     }
 
     /** Lists what is still missing for the view: newest frame first, from the middle of the screen outwards. */
     private fun rebuildQueue() {
-        val v = satWanted ?: return
+        val r = satWanted ?: return
         pending.clear()
+        val midX = (r.x0 + r.x1) / 2.0
+        val midY = (r.y0 + r.y1) / 2.0
+        val tiles = ArrayList<IntArray>()
+        for (y in r.y0..r.y1) for (x in r.x0..r.x1) tiles += intArrayOf(x, y)
+        tiles.sortBy { (it[0] - midX) * (it[0] - midX) + (it[1] - midY) * (it[1] - midY) }
         val seen = HashSet<Long>()
-        val times = satTimes
-        for ((i, t) in times.withIndex().reversed()) {
-            val r = if (i == times.size - 1) v.newest else v.loop
-            val midX = (r.x0 + r.x1) / 2.0
-            val midY = (r.y0 + r.y1) / 2.0
-            val tiles = ArrayList<IntArray>()
-            for (y in r.y0..r.y1) for (x in r.x0..r.x1) tiles += intArrayOf(x, y)
-            tiles.sortBy { (it[0] - midX) * (it[0] - midX) + (it[1] - midY) * (it[1] - midY) }
+        for (t in satTimes.reversed()) {
             for (tile in tiles) {
                 val key = needsWork(t, r.z, tile[0], tile[1]) ?: continue
                 if (seen.add(key)) pending.addLast(SatItem(t, r.z, tile[0], tile[1], key))
             }
-        }
-        queueTotal = pending.size + inFlight.size
-        updateProgress()
-    }
-
-    private fun updateProgress() {
-        val newest = satTimes.lastOrNull()
-        satLoading = newest != null && (pending.any { it.frame == newest } || inFlight.values.any { it == newest })
-        val left = pending.size + inFlight.size
-        satProgress = if (left == 0 || queueTotal == 0) -1f else (1f - left.toFloat() / queueTotal).coerceIn(0f, 1f)
-        Sat.viewerBusy = left > 0
-    }
-
-    private var retryJob: Job? = null
-
-    /** Tiles that failed are tried again by themselves after a short wait, while the map still wants them. */
-    private fun scheduleRetry() {
-        if (SatMem.failed.isEmpty() || retryJob?.isActive == true) return
-        retryJob = viewModelScope.launch {
-            delay(21_000)
-            rebuildQueue()
-            pump()
         }
     }
 
@@ -563,17 +500,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private fun pump() {
         while (workers < 6 && pending.isNotEmpty()) {
             workers++
+            satLoading = true
             viewModelScope.launch {
                 try {
                     while (true) {
                         val item = pending.removeFirstOrNull() ?: break
-                        if (item.key in inFlight) continue
-                        inFlight[item.key] = item.frame
+                        if (!inFlight.add(item.key)) continue
                         try {
                             loadTile(item)
                         } finally {
                             inFlight.remove(item.key)
-                            updateProgress()
                         }
                     }
                 } finally {
@@ -582,13 +518,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         // Anything dropped along the way (a colour change mid-download) is picked up again.
                         rebuildQueue()
                         if (pending.isNotEmpty()) pump() else {
-                            updateProgress()
-                            if (SatMem.failed.isNotEmpty()) {
-                                val why = Sat.lastError
-                                if (SatMem.mem.size() == 0 && satTimes.isNotEmpty()) {
-                                    satError = "Satellite images didn't load" + (if (why != null) ": $why." else ".") + " Trying again shortly."
-                                }
-                                scheduleRetry()
+                            satLoading = false
+                            if (SatMem.mem.size() == 0 && satTimes.isNotEmpty()) {
+                                satError = "No satellite images for this area. Check your connection, or move the map."
                             }
                             viewModelScope.launch { runCatching { Sat.trimCache(getApplication()) } }
                         }
@@ -602,51 +534,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val ctx = getApplication<Application>()
         val gen = styleGen
         val kind = overlay
-        val ok = overlayKind
-        val lutC = Sat.buildLut(sensitivity, true)
-        val lutG = Sat.buildLut(sensitivity, false)
+        // With rain or tops on, the cloud underneath is plain grey so only one set of colours is on the map.
+        val colour = enhanced && kind == Overlay.NONE
+        val lut = Sat.buildLut(sensitivity, colour)
         val src = Sat.sourceFor(item.z, item.x)
         val t = Sat.timeFor(src, item.frame) ?: return
-        val gKey = SatMem.key(SatMem.GREY, t, item.z, item.x, item.y)
-        val cKey = SatMem.key(SatMem.COLOUR, t, item.z, item.x, item.y)
+        val key = SatMem.key(0, t, item.z, item.x, item.y)
         val ovT = Sat.overlayTime(item.frame)
-        val oKey = if (ok >= 0) SatMem.key(ok, ovT, item.z, item.x, item.y) else 0L
-        val gNeed = SatMem.mem.get(gKey) == null
-        val cNeed = SatMem.mem.get(cKey) == null
-        val ovNeed = ok >= 0 && src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && !SatMem.isEmpty(oKey)
-        if (!gNeed && !cNeed && !ovNeed) return
+        val oKey = SatMem.key(1, ovT, item.z, item.x, item.y)
+        val irNeed = SatMem.mem.get(key) == null
+        val ovNeed = src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && !SatMem.isEmpty(oKey)
+        if (!irNeed && !ovNeed) return
 
         if (src.gibs != null) {
             val raw = Sat.loadGibsTile(ctx, src, t, item.z, item.x, item.y)
             if (raw != null) {
-                val c = if (cNeed) Sat.styleGibs(raw, lutC, true) else null
-                val g = if (gNeed) Sat.styleGibs(raw, lutG, false) else null
+                val bmp = Sat.styleGibs(raw, lut, colour)
                 raw.recycle()
-                if (gen == styleGen) {
-                    if (c != null) SatMem.mem.put(cKey, c.asImageBitmap())
-                    if (g != null) SatMem.mem.put(gKey, g.asImageBitmap())
-                    SatMem.tick++
-                    satError = null
-                }
-            } else if (gen == styleGen) SatMem.failed[gKey] = System.currentTimeMillis()
+                if (gen == styleGen) { SatMem.mem.put(key, bmp.asImageBitmap()); SatMem.tick++; satError = null }
+            } else if (gen == styleGen) SatMem.failed[key] = System.currentTimeMillis()
             return
         }
 
-        val grey = if (gNeed || cNeed || (ovNeed && kind == Overlay.TOPS)) {
-            Sat.loadIrTile(ctx, src, t, item.z, item.x, item.y)
-        } else null
-        if (gNeed || cNeed) {
+        val grey = if (irNeed || (ovNeed && kind == Overlay.TOPS)) Sat.loadIrTile(ctx, src, t, item.z, item.x, item.y) else null
+        if (irNeed) {
             if (grey != null) {
-                // Both cloud pictures are made at once, so switching Colour and IR never waits.
-                val c = if (cNeed) Sat.colourise(grey, lutC) else null
-                val g = if (gNeed) Sat.colourise(grey, lutG) else null
-                if (gen == styleGen) {
-                    if (c != null) SatMem.mem.put(cKey, c.asImageBitmap())
-                    if (g != null) SatMem.mem.put(gKey, g.asImageBitmap())
-                    SatMem.tick++
-                    satError = null
-                }
-            } else if (gen == styleGen) SatMem.failed[gKey] = System.currentTimeMillis()
+                val bmp = Sat.colourise(grey, lut)
+                if (gen == styleGen) { SatMem.mem.put(key, bmp.asImageBitmap()); SatMem.tick++; satError = null }
+            } else if (gen == styleGen) SatMem.failed[key] = System.currentTimeMillis()
         }
         if (ovNeed) {
             val raw = Sat.loadOverlayTile(ctx, kind, src, ovT, item.z, item.x, item.y)
@@ -679,12 +594,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * Tells the loader which satellite tiles the map needs. Tiles already held are kept; only what is missing
      * is queued. Called again with [force] to look for a newer picture.
      */
-    internal fun satWant(v: SatView, loop: Boolean, force: Boolean = false) {
-        if (!force && v == satWanted && loop == satLoop) return
-        satWanted = v
+    internal fun satWant(r: TileRange, loop: Boolean, force: Boolean = false) {
+        if (!force && r == satWanted && loop == satLoop) return
+        satWanted = r
         satLoop = loop
         prepJob?.cancel()
         prepJob = viewModelScope.launch {
+            if (satTimes.isEmpty()) satLoading = true
             val latest = Sat.latestTime()
             val times = if (loop) Sat.frameTimes(latest, loopHours) else listOf(latest)
             if (times != satTimes) {
@@ -699,10 +615,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val kind = overlay
             Sat.activeOverlay = kind
             if (kind != Overlay.NONE &&
-                (!Sat.isResolved(kind) || (kind == Overlay.RAIN && legends[kind] == null) || (kind == Overlay.TOPS && topsTable == null))
+                (!Sat.isResolved(kind) || (kind == Overlay.RAIN && overlayLegend == null) || (kind == Overlay.TOPS && topsTable == null))
             ) {
                 val legend = Sat.resolve(kind)
-                if (legend != null) legends[kind] = legend
                 if (kind == Overlay.RAIN && legend != null) overlayLegend = legend
                 if (kind == Overlay.TOPS && Sat.isResolved(kind)) topsTable = Sat.buildTopsTable(legend)
                 overlayMissing = !Sat.isResolved(kind)
@@ -722,7 +637,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             // NASA's satellites: find their newest picture, then queue their tiles.
-            for (src in Sat.sourcesIn(v.newest.z, v.newest.x0, v.newest.x1)) {
+            for (src in Sat.sourcesIn(r.z, r.x0, r.x1)) {
                 if (src.gibs == null) continue
                 launch {
                     val before = Sat.latestOf(src)
@@ -734,22 +649,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
             }
+            if (workers == 0 && pending.isEmpty()) satLoading = false
         }
-    }
-
-    // ------------------------------------------------------------ background prefetch
-
-    var prefetchOn by mutableStateOf(store.prefetchOn)
-        private set
-    var prefetchWifiOnly by mutableStateOf(store.prefetchWifiOnly)
-        private set
-
-    fun updatePrefetchOn(v: Boolean) { prefetchOn = v; store.prefetchOn = v }
-    fun updatePrefetchWifiOnly(v: Boolean) { prefetchWifiOnly = v; store.prefetchWifiOnly = v }
-
-    /** Called whenever the app comes to the front: background downloads carry on for 6 hours from here. */
-    fun markOpened() {
-        store.lastOpened = System.currentTimeMillis()
     }
 
     // ------------------------------------------------------------ forecast map layers (wind, icing)
@@ -782,54 +683,32 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun updateGridLevel(i: Int) { gridLevel = i; store.gridLevel = i }
     fun updateGridHour(h: Int) { gridHour = h }
 
-    /** The last few areas' forecast grids, so moving back and forth needs no new download. */
-    private val gridCache = object : LinkedHashMap<String, FcGrid>(8, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, FcGrid>?): Boolean = size > 8
-    }
-
     /** Tells the forecast layers which part of the map is on screen (centre and scale in Mercator world units). */
     fun wantGrid(cx: Double, cy: Double, scale: Double, wPx: Int, hPx: Int) {
         if (scale <= 0.0 || wPx <= 0 || hPx <= 0) return
-        val vw = wPx / scale
-        val vh = hPx / scale
-        val vWest = Merc.lon((cx - vw / 2).coerceIn(0.0, 1.0))
-        val vEast = Merc.lon((cx + vw / 2).coerceIn(0.0, 1.0))
-        val vNorth = Merc.lat((cy - vh / 2).coerceIn(0.03, 0.97))
-        val vSouth = Merc.lat((cy + vh / 2).coerceIn(0.03, 0.97))
-        val box: DoubleArray
-        val key: String
-        if (vWest >= Prefetch.GRID[0] && vSouth >= Prefetch.GRID[1] && vEast <= Prefetch.GRID[2] && vNorth <= Prefetch.GRID[3]) {
-            // Anywhere around the Maldives uses one fixed area, the same one downloaded in the background.
-            box = Prefetch.GRID
-            key = Prefetch.GRID_KEY
-        } else {
-            // Elsewhere: a grid-snapped area well beyond the screen, so normal panning stays inside it.
-            val b = snapBox(cx, cy, vw, vh, 2.0)
-            val west = Merc.lon(b[0].coerceIn(0.0, 1.0))
-            val east = Merc.lon(b[2].coerceIn(0.0, 1.0))
-            val north = Merc.lat(b[1].coerceIn(0.03, 0.97))
-            val south = Merc.lat(b[3].coerceIn(0.03, 0.97))
-            if (east - west < 0.5 || north - south < 0.5) return
-            box = doubleArrayOf(west, south, east, north)
-            key = "%.2f_%.2f_%.2f_%.2f".format(java.util.Locale.US, west, south, east, north).replace('-', 'm').replace('.', 'p')
-        }
+        // A grid-snapped area somewhat larger than the screen, so small moves reuse the same download.
+        val b = snapBox(cx, cy, wPx / scale, hPx / scale, 1.35)
+        val west = Merc.lon(b[0].coerceIn(0.0, 1.0))
+        val east = Merc.lon(b[2].coerceIn(0.0, 1.0))
+        val north = Merc.lat(b[1].coerceIn(0.03, 0.97))
+        val south = Merc.lat(b[3].coerceIn(0.03, 0.97))
+        if (east - west < 0.5 || north - south < 0.5) return
+        val key = "%.2f_%.2f_%.2f_%.2f".format(java.util.Locale.US, west, south, east, north).replace('-', 'm').replace('.', 'p')
         if (key != gridKey) {
             gridKey = key
-            gridBox = box
+            gridBox = doubleArrayOf(west, south, east, north)
         }
         ensureGrid()
     }
 
-    /** Shows the forecast grids for the area on screen, from memory, the phone, or a download, in that order. */
+    /** Downloads the forecast grids that are switched on and not yet held for the area on screen. */
     private fun ensureGrid() {
         val box = gridBox ?: return
         val key = gridKey
         val now = System.currentTimeMillis()
-        fun fresh(g: FcGrid?) = g != null && now - g.fetchedAt < 2 * 3600_000L
-        if (showWind) gridCache["W$key"]?.let { if (fresh(it)) windGrid = it }
-        if (showIcing) gridCache["I$key"]?.let { if (fresh(it)) iceGrid = it }
-        val needWind = showWind && !(windGrid?.key == key && fresh(windGrid))
-        val needIce = showIcing && !(iceGrid?.key == key && fresh(iceGrid))
+        fun stale(g: FcGrid?) = g == null || g.key != key || now - g.fetchedAt > 60 * 60_000L
+        val needWind = showWind && stale(windGrid)
+        val needIce = showIcing && stale(iceGrid)
         if (!needWind && !needIce) return
         gridJob?.cancel()
         val ctx = getApplication<Application>()
@@ -837,16 +716,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             gridLoading = true
             try {
                 delay(350)      // lets the map settle before spending a download
-                if (needWind) {
-                    val g = ExtraApi.grid(ctx, GridKind.WIND, box[0], box[1], box[2], box[3], key)
-                    gridCache["W$key"] = g
-                    windGrid = g
-                }
-                if (needIce) {
-                    val g = ExtraApi.grid(ctx, GridKind.ICING, box[0], box[1], box[2], box[3], key)
-                    gridCache["I$key"] = g
-                    iceGrid = g
-                }
+                if (needWind) windGrid = ExtraApi.grid(ctx, GridKind.WIND, box[0], box[1], box[2], box[3], key)
+                if (needIce) iceGrid = ExtraApi.grid(ctx, GridKind.ICING, box[0], box[1], box[2], box[3], key)
                 gridError = null
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e

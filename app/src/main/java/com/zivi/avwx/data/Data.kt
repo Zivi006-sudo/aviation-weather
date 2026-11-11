@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.sync.withPermit
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -177,23 +176,6 @@ class Store(ctx: Context) {
     var enhanced: Boolean
         get() = prefs.getBoolean("enhanced", true)
         set(v) = prefs.edit().putBoolean("enhanced", v).apply()
-
-    /** Download the Maldives pictures and forecasts in the background. */
-    var prefetchOn: Boolean
-        get() = prefs.getBoolean("prefetch", true)
-        set(v) = prefs.edit().putBoolean("prefetch", v).apply()
-
-    var prefetchWifiOnly: Boolean
-        get() = prefs.getBoolean("prefetchWifi", false)
-        set(v) = prefs.edit().putBoolean("prefetchWifi", v).apply()
-
-    var lastOpened: Long
-        get() = prefs.getLong("lastOpened", 0L)
-        set(v) = prefs.edit().putLong("lastOpened", v).apply()
-
-    var lastGridPrefetch: Long
-        get() = prefs.getLong("lastGridPrefetch", 0L)
-        set(v) = prefs.edit().putLong("lastGridPrefetch", v).apply()
 
     /** Extra satellite layer: "none", "rain" or "cth". */
     var overlay: String
@@ -433,7 +415,7 @@ class Aloft(
 }
 
 enum class GridKind(val cols: Int, val rows: Int) {
-    WIND(16, 22),     // wind at every level
+    WIND(14, 20),     // wind at every level
     ICING(10, 12),    // temperature and humidity at the upper levels
 }
 
@@ -646,9 +628,9 @@ object ExtraApi {
 
     /**
      * Forecast grid for an area, for every map level at once, so changing level or time needs no new download.
-     * A copy is kept on the phone and used while younger than [maxAgeMin] minutes.
+     * A copy is kept on the phone for an hour.
      */
-    suspend fun grid(ctx: Context, kind: GridKind, west: Double, south: Double, east: Double, north: Double, key: String, maxAgeMin: Int = 120): FcGrid =
+    suspend fun grid(ctx: Context, kind: GridKind, west: Double, south: Double, east: Double, north: Double, key: String): FcGrid =
         withContext(Dispatchers.IO) {
             val cols = kind.cols
             val rows = kind.rows
@@ -676,7 +658,7 @@ object ExtraApi {
             val dir = File(ctx.cacheDir, "grid").apply { mkdirs() }
             val file = File(dir, "${kind.name}_$key.json")
             var fetchedAt = file.lastModified()
-            val text = if (file.exists() && file.length() > 1000 && System.currentTimeMillis() - fetchedAt < maxAgeMin * 60_000L) {
+            val text = if (file.exists() && file.length() > 1000 && System.currentTimeMillis() - fetchedAt < 60 * 60_000L) {
                 file.readText()
             } else {
                 OmBudget.take((n * maxOf(1.0, vars.size / 10.0)).toInt())
@@ -684,7 +666,7 @@ object ExtraApi {
                     "&wind_speed_unit=kn&forecast_days=3&timeformat=unixtime&timezone=GMT"
                 val t = Net.getText(url, maxBytes = 14_000_000).trim()
                 if (!t.startsWith("[")) throw java.io.IOException("forecast grid refused")
-                dir.listFiles()?.forEach { f -> if (System.currentTimeMillis() - f.lastModified() > 4 * 3600_000L) f.delete() }
+                dir.listFiles()?.forEach { f -> if (System.currentTimeMillis() - f.lastModified() > 3 * 3600_000L) f.delete() }
                 file.writeText(t)
                 fetchedAt = System.currentTimeMillis()
                 t
@@ -810,26 +792,6 @@ object Sat {
     )
 
     private const val WMS = "https://view.eumetsat.int/geoserver/wms"
-    /** At most 6 picture downloads from EUMETSAT at a time, for the whole app (map and background together). */
-    private val gate = kotlinx.coroutines.sync.Semaphore(6)
-    /** True while the satellite map is loading; the background download waits so the map comes first. */
-    @Volatile var viewerBusy = false
-    /** Why the last picture download failed, in plain words, or null after a success. */
-    @Volatile var lastError: String? = null
-
-    private suspend fun fetchTile(url: String): ByteArray = gate.withPermit {
-        try {
-            Net.getBytes(url, maxBytes = 2_000_000).also { lastError = null }
-        } catch (e: Exception) {
-            lastError = when (e) {
-                is java.net.UnknownHostException -> "no internet connection"
-                is java.net.SocketTimeoutException -> "EUMETSAT is not answering (timed out)"
-                is java.net.ConnectException -> "can't reach EUMETSAT"
-                else -> e.message?.let { m -> if (m.startsWith("HTTP")) "EUMETSAT refused the request ($m)" else m } ?: "download failed"
-            }
-            throw e
-        }
-    }
     private val ISO_RE = Regex("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z")
     private val NAME_RE = Regex("<Name>([^<]+)</Name>")
 
@@ -987,13 +949,6 @@ object Sat {
     }
 
     /** Greyscale infrared tile from a EUMETSAT satellite, from the phone if already downloaded. */
-    fun hasIrTile(ctx: Context, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Boolean =
-        File(cacheDir(ctx), "ir${src.id}_${time.epochSecond}_${z}_${x}_$y").let { it.exists() && it.length() > 300 }
-
-    fun hasOverlayTile(ctx: Context, o: Overlay, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Boolean =
-        File(cacheDir(ctx), "${o.key}${src.id}_${time.epochSecond}_${z}_${x}_$y").let { it.exists() && it.length() > 60 }
-
-    /** Greyscale infrared tile from a EUMETSAT satellite, from the phone if already downloaded. */
     suspend fun loadIrTile(ctx: Context, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
         val name = "ir${src.id}_${time.epochSecond}_${z}_${x}_$y"
         if (noData.containsKey(name)) return@withContext null
@@ -1009,9 +964,8 @@ object Sat {
             val tryList = if (known != null) listOf(known) else src.irLayers.indices.toList()
             var answered = false
             for (i in tryList) {
-                val layer = src.irLayers[i].replace(":", "%3A")
                 val bytes = try {
-                    fetchTile(wmsTileUrl(layer, "image%2Fjpeg", time, false, z, x, y))
+                    Net.getBytes(wmsTileUrl(src.irLayers[i].replace(":", "%3A"), "image%2Fjpeg", time, false, z, x, y), maxBytes = 2_000_000)
                 } catch (e: Exception) {
                     continue
                 }
@@ -1178,7 +1132,7 @@ object Sat {
             }
             for (layer in layers) {
                 val bytes = try {
-                    fetchTile(wmsTileUrl(layer.replace(":", "%3A"), "image%2Fpng", time, true, z, x, y))
+                    Net.getBytes(wmsTileUrl(layer.replace(":", "%3A"), "image%2Fpng", time, true, z, x, y), maxBytes = 2_000_000)
                 } catch (e: Exception) {
                     continue
                 }

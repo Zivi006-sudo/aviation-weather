@@ -85,6 +85,7 @@ import com.zivi.avwx.data.FcGrid
 import com.zivi.avwx.data.Overlay
 import com.zivi.avwx.data.Sat
 import com.zivi.avwx.data.Sigmet
+import com.zivi.avwx.data.TileSource
 import com.zivi.avwx.wx.FlightCat
 import com.zivi.avwx.wx.Merc
 import com.zivi.avwx.wx.Upper
@@ -131,7 +132,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     }
 
     // Satellite tiles for the view. Changes only when the view crosses into new tiles, not on every pan step.
-    val satR by remember(cam) { derivedStateOf { satView(cam) } }
+    val satR by remember(cam) { derivedStateOf { satRange(cam, vm.loopFrames) } }
     LaunchedEffect(cam) {
         snapshotFlow { satR }.collectLatest { r ->
             if (r != null) {
@@ -192,8 +193,8 @@ fun MapScreen(vm: AppViewModel, now: Long) {
 
     val apBoxes = remember { ArrayList<RectF>() }
     val allAirports = remember(vm.airports) { MvAirports.merged(vm.airports) }
-    val irPlan = remember { SatPlan() }
-    val ovPlan = remember { SatPlan() }
+    val irPlan = remember { SatPlan(0) }
+    val ovPlan = remember { SatPlan(1) }
     val airports = vm.airports
     val decoded = vm.decoded
     val sigmets = if (vm.showSigmet) vm.sigmets else emptyList()
@@ -253,9 +254,8 @@ fun MapScreen(vm: AppViewModel, now: Long) {
 
                 // ---- satellite, then the extra layer
                 val p = pos.floatValue
-                drawSat(irPlan, cam, satR, times, vm.cloudKind, p, if (wash != null) 0.8f else 1f, fade = true)
-                val ok = vm.overlayKind
-                if (overlayOn && ok >= 0) drawSat(ovPlan, cam, satR, times, ok, p, 0.9f, fade = false)
+                drawSat(irPlan, cam, satR, times, p, if (wash != null) 0.8f else 1f, fade = true)
+                if (overlayOn) drawSat(ovPlan, cam, satR, times, p, 0.9f, fade = false)
 
                 // ---- forecast layers
                 if (iceGrid != null && level > 0 && iceIdx < iceGrid.times.size) drawIcing(iceGrid, level, iceIdx, cam)
@@ -355,15 +355,6 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                     Toggle("List", false) { showSigmetList = true }
                 }
                 Toggle("Maldives", false) { cam.home() }
-            }
-            val prog = vm.satProgress
-            if (prog >= 0f && !vm.satLoading) {
-                LinearProgressIndicator(
-                    progress = { prog },
-                    modifier = Modifier.fillMaxWidth().height(2.dp).clip(RoundedCornerShape(1.dp)),
-                    color = Color(0xFF4FC3F7),
-                    trackColor = Color(0x33FFFFFF),
-                )
             }
             if (overlayOn && vm.overlayMissing && !vm.satLoading) {
                 Note((if (vm.overlay == Overlay.RAIN) "The rain layer" else "The cloud top layer") + " isn't available from EUMETSAT right now.")
