@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -809,10 +810,26 @@ object Sat {
     )
 
     private const val WMS = "https://view.eumetsat.int/geoserver/wms"
-    /** EUMETSAT's ready-made tile store: much quicker when a tile has already been drawn for someone else. */
-    private const val GWC = "https://view.eumetsat.int/geoserver/gwc/service/wms"
-    @Volatile private var gwcFails = 0
-    private val gwcOn: Boolean get() = gwcFails < 6
+    /** At most 6 picture downloads from EUMETSAT at a time, for the whole app (map and background together). */
+    private val gate = kotlinx.coroutines.sync.Semaphore(6)
+    /** True while the satellite map is loading; the background download waits so the map comes first. */
+    @Volatile var viewerBusy = false
+    /** Why the last picture download failed, in plain words, or null after a success. */
+    @Volatile var lastError: String? = null
+
+    private suspend fun fetchTile(url: String): ByteArray = gate.withPermit {
+        try {
+            Net.getBytes(url, maxBytes = 2_000_000).also { lastError = null }
+        } catch (e: Exception) {
+            lastError = when (e) {
+                is java.net.UnknownHostException -> "no internet connection"
+                is java.net.SocketTimeoutException -> "EUMETSAT is not answering (timed out)"
+                is java.net.ConnectException -> "can't reach EUMETSAT"
+                else -> e.message?.let { m -> if (m.startsWith("HTTP")) "EUMETSAT refused the request ($m)" else m } ?: "download failed"
+            }
+            throw e
+        }
+    }
     private val ISO_RE = Regex("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z")
     private val NAME_RE = Regex("<Name>([^<]+)</Name>")
 
@@ -929,9 +946,9 @@ object Sat {
         return (n downTo 0).map { latest.minusSeconds(it * STEP_MIN * 60) }
     }
 
-    private fun wmsTileUrl(layerEnc: String, format: String, time: Instant, transparent: Boolean, z: Int, x: Int, y: Int, gwc: Boolean = false): String {
+    private fun wmsTileUrl(layerEnc: String, format: String, time: Instant, transparent: Boolean, z: Int, x: Int, y: Int): String {
         val n = (1 shl z).toDouble()
-        val sb = StringBuilder(if (gwc) GWC else WMS)
+        val sb = StringBuilder(WMS)
         sb.append("?service=WMS&version=1.1.1&request=GetMap&layers=").append(layerEnc)
         sb.append("&styles=&format=").append(format)
         sb.append("&srs=EPSG%3A3857&bbox=")
@@ -940,7 +957,6 @@ object Sat {
         sb.append("&width=256&height=256")
         if (transparent) sb.append("&transparent=true")
         sb.append("&time=").append(time.toString().replace(":", "%3A"))
-        if (gwc) sb.append("&tiled=true")
         return sb.toString()
     }
 
@@ -977,11 +993,8 @@ object Sat {
     fun hasOverlayTile(ctx: Context, o: Overlay, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Boolean =
         File(cacheDir(ctx), "${o.key}${src.id}_${time.epochSecond}_${z}_${x}_$y").let { it.exists() && it.length() > 60 }
 
-    /**
-     * Greyscale infrared tile from a EUMETSAT satellite, from the phone if already downloaded.
-     * With [preferCache] the ready-made tile store is tried first, then the normal service.
-     */
-    suspend fun loadIrTile(ctx: Context, src: SatSource, time: Instant, z: Int, x: Int, y: Int, preferCache: Boolean = false): Bitmap? = withContext(Dispatchers.IO) {
+    /** Greyscale infrared tile from a EUMETSAT satellite, from the phone if already downloaded. */
+    suspend fun loadIrTile(ctx: Context, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
         val name = "ir${src.id}_${time.epochSecond}_${z}_${x}_$y"
         if (noData.containsKey(name)) return@withContext null
         val f = File(cacheDir(ctx), name)
@@ -997,24 +1010,8 @@ object Sat {
             var answered = false
             for (i in tryList) {
                 val layer = src.irLayers[i].replace(":", "%3A")
-                if (preferCache && gwcOn) {
-                    val quick = try {
-                        Net.getBytes(wmsTileUrl(layer, "image%2Fjpeg", time, false, z, x, y, gwc = true), maxBytes = 2_000_000)
-                    } catch (e: Exception) {
-                        null
-                    }
-                    val qb = quick?.let { BitmapFactory.decodeByteArray(it, 0, it.size, opts) }
-                    if (qb != null && !isFlat(qb)) {
-                        gwcFails = 0
-                        irLayerIdx[src.id] = i
-                        f.writeBytes(quick)
-                        return@withContext qb
-                    }
-                    qb?.recycle()
-                    gwcFails++
-                }
                 val bytes = try {
-                    Net.getBytes(wmsTileUrl(layer, "image%2Fjpeg", time, false, z, x, y), maxBytes = 2_000_000)
+                    fetchTile(wmsTileUrl(layer, "image%2Fjpeg", time, false, z, x, y))
                 } catch (e: Exception) {
                     continue
                 }
@@ -1181,7 +1178,7 @@ object Sat {
             }
             for (layer in layers) {
                 val bytes = try {
-                    Net.getBytes(wmsTileUrl(layer.replace(":", "%3A"), "image%2Fpng", time, true, z, x, y), maxBytes = 2_000_000)
+                    fetchTile(wmsTileUrl(layer.replace(":", "%3A"), "image%2Fpng", time, true, z, x, y))
                 } catch (e: Exception) {
                     continue
                 }

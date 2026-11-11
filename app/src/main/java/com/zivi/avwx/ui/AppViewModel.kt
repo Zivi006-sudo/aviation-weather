@@ -56,7 +56,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // While the app is open (or minimized but still running), the newest pictures for the Maldives
         // are downloaded as they come out, so opening the Satellite tab is quick.
         viewModelScope.launch {
-            delay(8_000)
+            delay(30_000)
             while (true) {
                 try {
                     Prefetch.run(app, store)
@@ -508,7 +508,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (key in inFlight) return null
         val failedAt = SatMem.failed[key]
         val cloudMissing = SatMem.mem.get(key) == null || SatMem.mem.get(SatMem.key(SatMem.COLOUR, t, z, x, y)) == null
-        val irNeed = cloudMissing && (failedAt == null || System.currentTimeMillis() - failedAt > 60_000L)
+        val irNeed = cloudMissing && (failedAt == null || System.currentTimeMillis() - failedAt > 20_000L)
         val ok = overlayKind
         val ovNeed = ok >= 0 && src.gibs == null && overlayReady() && run {
             val oKey = SatMem.key(ok, Sat.overlayTime(frame), z, x, y)
@@ -544,6 +544,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         satLoading = newest != null && (pending.any { it.frame == newest } || inFlight.values.any { it == newest })
         val left = pending.size + inFlight.size
         satProgress = if (left == 0 || queueTotal == 0) -1f else (1f - left.toFloat() / queueTotal).coerceIn(0f, 1f)
+        Sat.viewerBusy = left > 0
+    }
+
+    private var retryJob: Job? = null
+
+    /** Tiles that failed are tried again by themselves after a short wait, while the map still wants them. */
+    private fun scheduleRetry() {
+        if (SatMem.failed.isEmpty() || retryJob?.isActive == true) return
+        retryJob = viewModelScope.launch {
+            delay(21_000)
+            rebuildQueue()
+            pump()
+        }
     }
 
     /** Starts downloads for the queue, six at a time. A download that has started always finishes. */
@@ -570,8 +583,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         rebuildQueue()
                         if (pending.isNotEmpty()) pump() else {
                             updateProgress()
-                            if (SatMem.mem.size() == 0 && satTimes.isNotEmpty()) {
-                                satError = "No satellite images for this area. Check your connection, or move the map."
+                            if (SatMem.failed.isNotEmpty()) {
+                                val why = Sat.lastError
+                                if (SatMem.mem.size() == 0 && satTimes.isNotEmpty()) {
+                                    satError = "Satellite images didn't load" + (if (why != null) ": $why." else ".") + " Trying again shortly."
+                                }
+                                scheduleRetry()
                             }
                             viewModelScope.launch { runCatching { Sat.trimCache(getApplication()) } }
                         }
@@ -598,7 +615,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val cNeed = SatMem.mem.get(cKey) == null
         val ovNeed = ok >= 0 && src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && !SatMem.isEmpty(oKey)
         if (!gNeed && !cNeed && !ovNeed) return
-        val newest = item.frame == satTimes.lastOrNull()
 
         if (src.gibs != null) {
             val raw = Sat.loadGibsTile(ctx, src, t, item.z, item.x, item.y)
@@ -617,7 +633,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         val grey = if (gNeed || cNeed || (ovNeed && kind == Overlay.TOPS)) {
-            Sat.loadIrTile(ctx, src, t, item.z, item.x, item.y, preferCache = newest)
+            Sat.loadIrTile(ctx, src, t, item.z, item.x, item.y)
         } else null
         if (gNeed || cNeed) {
             if (grey != null) {

@@ -51,6 +51,15 @@ object Prefetch {
         }
     }
 
+    /** The map on screen always goes first: background downloads wait while it is loading. */
+    private suspend fun waitForMap() {
+        var waited = 0
+        while (Sat.viewerBusy && waited < 120) {
+            kotlinx.coroutines.delay(1000)
+            waited++
+        }
+    }
+
     private class T(val z: Int, val x: Int, val y: Int)
 
     private fun tiles(): List<T> {
@@ -67,7 +76,7 @@ object Prefetch {
     }
 
     private suspend fun satellite(ctx: Context, store: Store) = coroutineScope {
-        val gate = Semaphore(4)
+        val gate = Semaphore(2)
         val latest = Sat.latestTime()
         val frames = Sat.frameTimes(latest, store.loopHours.coerceIn(1, 3))
         val list = tiles()
@@ -79,7 +88,8 @@ object Prefetch {
             if (src.gibs != null || Sat.hasIrTile(ctx, src, f, t.z, t.x, t.y)) continue
             jobs.add(async {
                 gate.withPermit {
-                    Sat.loadIrTile(ctx, src, f, t.z, t.x, t.y, preferCache = f == latest)?.recycle()
+                    waitForMap()
+                    Sat.loadIrTile(ctx, src, f, t.z, t.x, t.y)?.recycle()
                 }
             })
         }
@@ -104,6 +114,7 @@ object Prefetch {
                 if (!needOv && !needIr) continue
                 oj.add(async {
                     gate.withPermit {
+                        waitForMap()
                         if (needOv) {
                             val b = Sat.loadOverlayTile(ctx, o, src, f, t.z, t.x, t.y)
                             if (b == null || !Sat.hasOverlayTile(ctx, o, src, f, t.z, t.x, t.y)) empty[name] = System.currentTimeMillis()
