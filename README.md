@@ -44,4 +44,4 @@ download `AviationWeather.apk` and install it.
 - Radar imagery: Sentinel-2 cloudless – https://s2maps.eu by EOX IT Services GmbH (contains modified Copernicus Sentinel data 2024)
 - Satellite and rain rate: EUMETSAT EUMETView WMS (`msg_iodc:ir108`)
 - Winds aloft: Open-Meteo
-- Map: © OpenStreetMap contributors, CARTO
+- Map: © CARTO, © OpenStreetMap contributors; place names: Natural Earth (public domain)

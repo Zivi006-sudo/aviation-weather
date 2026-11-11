@@ -187,6 +187,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return null
     }
 
+    /** Adds an airport whose name and position are already known (one tapped on a map). */
+    fun addKnownAirport(a: Airport) {
+        if (airports.any { it.icao == a.icao }) return
+        saveAirports(airports + a)
+        if (a.icao in recents) { recents = recents - a.icao; store.saveRecents(recents) }
+        refresh()
+    }
+
+    /** The airport whose weather is being looked up for a map tap, or null. */
+    var peeking by mutableStateOf<String?>(null)
+        private set
+
+    /** Fetches the latest reports for one airport tapped on a map, if they aren't held yet. */
+    fun peek(icao: String) {
+        val have = rawWx[icao]
+        if (have != null && System.currentTimeMillis() - have.fetchedAt < 10 * 60_000L) return
+        peeking = icao
+        viewModelScope.launch {
+            try {
+                val fresh = HashMap<String, StationWx>()
+                try {
+                    fresh.putAll(WxApi.fetch(listOf(icao)).wx)
+                } catch (e: Exception) {
+                    // Try the second source anyway.
+                }
+                try {
+                    val r = pickReports(MvMet.reports(getApplication()), Instant.now())[icao]
+                    if (r != null) fresh[icao] = WxMerge.pick(fresh[icao], StationWx(icao, r.first, r.second, System.currentTimeMillis()))
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // Nothing more to try.
+                }
+                if (fresh.isNotEmpty()) applyWx(fresh)
+            } finally {
+                if (peeking == icao) peeking = null
+            }
+        }
+    }
+
     fun removeAirport(icao: String) {
         saveAirports(airports.filter { it.icao != icao })
         recents = (listOf(icao) + recents.filter { it != icao }).take(8)

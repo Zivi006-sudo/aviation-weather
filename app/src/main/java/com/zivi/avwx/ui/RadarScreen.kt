@@ -46,7 +46,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import android.graphics.RectF
 import com.zivi.avwx.data.Aircraft
+import com.zivi.avwx.data.Airport
 import com.zivi.avwx.data.TileSource
 import com.zivi.avwx.wx.FlightCat
 import com.zivi.avwx.wx.Merc
@@ -129,8 +131,12 @@ fun RadarScreen(vm: AppViewModel, now: Long) {
     TileLoader(TileSource.SAT, cam)
 
     val aircraft = vm.aircraft
-    val airports = vm.airports
+    val allAirports = remember(vm.airports) { MvAirports.merged(vm.airports) }
     val decoded = vm.decoded
+    val places = rememberPlaces()
+    val names = remember { PlaceLabels(dark = true) }
+    val apBoxes = remember { ArrayList<RectF>() }
+    var tapped by remember { mutableStateOf<Airport?>(null) }
     val labelPaint = remember {
         Paint().apply {
             isAntiAlias = true
@@ -157,7 +163,12 @@ fun RadarScreen(vm: AppViewModel, now: Long) {
                             val d = dx * dx + dy * dy
                             if (d < bestD) { bestD = d; best = a.hex }
                         }
-                        selected = best
+                        if (best != null) {
+                            selected = best
+                        } else {
+                            val ap = airportAt(allAirports, cam, size.width.toFloat(), size.height.toFloat(), p.x, p.y, 24.dp.toPx())
+                            if (ap != null) tapped = ap else selected = null
+                        }
                     }
                 }
         ) {
@@ -174,23 +185,9 @@ fun RadarScreen(vm: AppViewModel, now: Long) {
                     drawSat(cloudPlan, cam, cloudR, cloudTimes, (cloudTimes.size - 1).toFloat(), 0.8f, fade = false)
                 }
 
-                // ---- airports
-                val dot = 4.dp.toPx()
-                labelPaint.textSize = 11.sp.toPx()
-                for (ap in airports) {
-                    val lat = ap.lat
-                    val lon = ap.lon
-                    if (lat != null && lon != null) {
-                        val x = px(w, ox, s, Merc.x(lon))
-                        val y = px(h, oy, s, Merc.y(lat))
-                        if (x > -40f && y > -40f && x < w + 40f && y < h + 40f) {
-                            val cat = decoded[ap.icao]?.metar?.category ?: FlightCat.UNKNOWN
-                            drawCircle(Color.Black, radius = dot + 1.5.dp.toPx(), center = Offset(x, y))
-                            drawCircle(catColor(cat), radius = dot, center = Offset(x, y))
-                            drawLabel(labelPaint, ap.icao, x + dot + 4.dp.toPx(), y - dot - 2.dp.toPx(), centre = false)
-                        }
-                    }
-                }
+                // ---- airports (all Maldivian ones, yours in colour), then English place names around them
+                drawAirports(allAirports, decoded, cam, labelPaint, apBoxes)
+                names.draw(this, places, cam, apBoxes)
 
                 // ---- trail of the selected aircraft
                 val sel = selected
@@ -263,14 +260,17 @@ fun RadarScreen(vm: AppViewModel, now: Long) {
                 Spacer(Modifier.height(6.dp))
             }
             Text(
-                "Traffic: airplanes.live / adsb.lol · Imagery: Sentinel-2 cloudless – s2maps.eu by EOX IT Services GmbH " +
+                "Traffic: airplanes.live / adsb.lol · Names: Natural Earth · Imagery: Sentinel-2 cloudless – s2maps.eu by EOX IT Services GmbH " +
                     "(contains modified Copernicus Sentinel data 2024)",
                 fontSize = 9.sp, lineHeight = 11.sp, color = Color.White.copy(alpha = 0.75f),
                 modifier = Modifier.background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(horizontal = 6.dp, vertical = 3.dp),
             )
         }
     }
+    val tap = tapped
+    if (tap != null) AirportPeek(vm, tap) { tapped = null }
 }
+
 
 @Composable
 private fun AircraftCard(a: Aircraft?, onClose: () -> Unit) {

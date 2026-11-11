@@ -79,6 +79,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import android.graphics.RectF
+import com.zivi.avwx.data.Airport
 import com.zivi.avwx.data.FcGrid
 import com.zivi.avwx.data.Overlay
 import com.zivi.avwx.data.Sat
@@ -95,8 +97,8 @@ import kotlin.math.floor
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-private const val DWELL_SEC = 1.2f                 // pause on the newest image before the loop restarts
-private val SPEEDS = floatArrayOf(1.5f, 3f, 6f)     // images per second
+private const val DWELL_SEC = 2f                   // pause on the newest image before the loop restarts
+private val SPEEDS = floatArrayOf(0.8f, 1.5f, 3f)   // images per second
 private val SPEED_LABELS = arrayOf("Slow", "Normal", "Fast")
 private val SEA = Color(0xFFAAD3DF)
 private val PANEL = Color(0xF010161D)
@@ -115,6 +117,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     val pos = remember { mutableFloatStateOf(0f) }
     var showSigmetList by remember { mutableStateOf(false) }
     var tip by remember { mutableStateOf<DoubleArray?>(null) }       // tapped point: latitude, longitude
+    var tapped by remember { mutableStateOf<Airport?>(null) }
     val cam = rememberSaveable(saver = MapCam.saver(13.0)) { MapCam(Merc.x(HOME_LON), Merc.y(HOME_LAT), 0.0, 13.0) }
 
     val owner = LocalLifecycleOwner.current
@@ -188,6 +191,10 @@ fun MapScreen(vm: AppViewModel, now: Long) {
 
     TileLoader(TileSource.MAP, cam)
 
+    val places = rememberPlaces()
+    val names = remember { PlaceLabels(dark = false) }
+    val apBoxes = remember { ArrayList<RectF>() }
+    val allAirports = remember(vm.airports) { MvAirports.merged(vm.airports) }
     val irPlan = remember { SatPlan(0) }
     val ovPlan = remember { SatPlan(1) }
     val airports = vm.airports
@@ -223,7 +230,10 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                 .pointerInput(Unit) {
                     detectTapGestures { p ->
                         val s = cam.scale
-                        if (s > 0.0 && (vm.showWind || vm.showIcing)) {
+                        val ap = airportAt(allAirports, cam, size.width.toFloat(), size.height.toFloat(), p.x, p.y, 24.dp.toPx())
+                        if (ap != null) {
+                            tapped = ap
+                        } else if (s > 0.0 && (vm.showWind || vm.showIcing)) {
                             val lat = Merc.lat(cam.cy + (p.y - size.height / 2.0) / s)
                             val lon = Merc.lon(cam.cx + (p.x - size.width / 2.0) / s)
                             tip = doubleArrayOf(lat, lon)
@@ -279,24 +289,9 @@ fun MapScreen(vm: AppViewModel, now: Long) {
 
                 drawGraticule(s, ox, oy, labelPaint)
 
-                // ---- airports, coloured by flight category
-                val dot = 5.dp.toPx()
-                labelPaint.textSize = 12.sp.toPx()
-                for (ap in airports) {
-                    val lat = ap.lat
-                    val lon = ap.lon
-                    if (lat != null && lon != null) {
-                        val x = px(w, ox, s, Merc.x(lon))
-                        val y = px(h, oy, s, Merc.y(lat))
-                        if (x > -40f && y > -40f && x < w + 40f && y < h + 40f) {
-                            val cat = decoded[ap.icao]?.metar?.category ?: FlightCat.UNKNOWN
-                            drawCircle(Color.Black, radius = dot + 2.dp.toPx(), center = Offset(x, y))
-                            drawCircle(catColor(cat), radius = dot, center = Offset(x, y))
-                            drawCircle(Color.White, radius = dot, center = Offset(x, y), style = Stroke(width = 1.dp.toPx()))
-                            drawLabel(labelPaint, ap.icao, x + dot + 4.dp.toPx(), y + 4.dp.toPx(), centre = false)
-                        }
-                    }
-                }
+                // ---- airports (all Maldivian ones, yours in colour), then English place names around them
+                drawAirports(allAirports, decoded, cam, labelPaint, apBoxes)
+                names.draw(this, places, cam, apBoxes)
 
                 // ---- the point tapped for a forecast read-out
                 val tp = tip
@@ -393,6 +388,8 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     if (showSigmetList) {
         SigmetDialog(vm.sigmets) { showSigmetList = false }
     }
+    val tap = tapped
+    if (tap != null) AirportPeek(vm, tap) { tapped = null }
 }
 
 /** The time read-out, play controls, slider and colour key. The only part of the screen rebuilt while the loop plays. */
@@ -504,7 +501,7 @@ private fun Timeline(
             KeyBar("Cloud", colours, "low", "coldest tops / deep CB")
         }
         Text(
-            "Map © OpenStreetMap, CARTO · Satellite © EUMETSAT, NASA GIBS · Forecast: Open-Meteo",
+            "Map © CARTO, OpenStreetMap · Names: Natural Earth · Satellite © EUMETSAT, NASA GIBS · Forecast: Open-Meteo",
             fontSize = 8.sp, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp),
         )

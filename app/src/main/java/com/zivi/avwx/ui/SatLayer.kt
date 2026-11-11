@@ -222,8 +222,8 @@ internal fun DrawScope.drawSat(plan: SatPlan, cam: MapCam, range: TileRange?, ti
     }
     val i = floor(p).toInt().coerceIn(0, frames.size - 1)
     val frac = p - i
-    // Smoothstep: holds each picture briefly, then fades to the next.
-    val f = if (i + 1 < frames.size) frac * frac * (3f - 2f * frac) else 0f
+    // A steady fade across the whole step, so the clouds appear to drift rather than jump.
+    val f = if (i + 1 < frames.size) frac else 0f
     drawPieces(frames[i], plan.z, cam, alpha * (1f - f))
     if (f > 0.01f) drawPieces(frames[i + 1], plan.z, cam, alpha * f)
 }

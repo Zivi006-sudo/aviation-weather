@@ -707,7 +707,7 @@ object ExtraApi {
 // ---------------------------------------------------------------- base map tiles
 
 enum class TileSource(val key: String, val maxZoom: Int, val parallel: Int) {
-    MAP("osm", 12, 2),      // OpenStreetMap asks for at most two downloads at a time
+    MAP("carto", 12, 4),    // street map without names; the app draws English names itself
     SAT("sat", 13, 4),
 }
 
@@ -716,8 +716,9 @@ object Tiles {
 
     private fun urls(s: TileSource, z: Int, x: Int, y: Int): List<String> = when (s) {
         TileSource.MAP -> listOf(
-            "https://tile.openstreetmap.org/$z/$x/$y.png",
-            "https://a.basemaps.cartocdn.com/rastertiles/voyager/$z/$x/$y.png",
+            "https://a.basemaps.cartocdn.com/rastertiles/voyager_nolabels/$z/$x/$y.png",
+            "https://b.basemaps.cartocdn.com/rastertiles/voyager_nolabels/$z/$x/$y.png",
+            "https://c.basemaps.cartocdn.com/rastertiles/voyager_nolabels/$z/$x/$y.png",
         )
         TileSource.SAT -> listOf(
             "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/$z/$y/$x.jpg",
