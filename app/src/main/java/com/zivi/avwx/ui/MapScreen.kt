@@ -474,6 +474,13 @@ private fun Timeline(
             if (err != null) {
                 Text(err, fontSize = 12.sp, color = Amber, modifier = Modifier.padding(top = 2.dp))
             }
+            val ovTo = vm.overlayTo
+            if (vm.overlay != Overlay.NONE && ovTo != null && shown.isAfter(ovTo)) {
+                Text(
+                    (if (vm.overlay == Overlay.RAIN) "Rain" else "Cloud tops") + " to " + Fmt.zulu(ovTo) + " · newer not out yet",
+                    fontSize = 12.sp, color = Amber, modifier = Modifier.padding(bottom = 2.dp),
+                )
+            }
         }
 
         // ---- one colour key at a time, kept here so it never covers the map

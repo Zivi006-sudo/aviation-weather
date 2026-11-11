@@ -29,8 +29,13 @@ internal object SatMem {
     }
     /** Cloud tiles that failed to load, with when, so they are not asked for again straight away. */
     val failed = HashMap<Long, Long>()
-    /** Extra-layer tiles that were loaded and had nothing in them. */
-    val empty = HashSet<Long>()
+    /** Extra-layer tiles that were loaded and had nothing in them, with when. Asked again after a few minutes. */
+    val empty = HashMap<Long, Long>()
+
+    fun isEmpty(k: Long): Boolean {
+        val at = empty[k] ?: return false
+        return System.currentTimeMillis() - at < 4 * 60_000L
+    }
     var tick by mutableIntStateOf(0)
 
     /** [time] is the satellite's own picture time, so two loop frames showing the same picture share one tile. */
@@ -119,7 +124,7 @@ internal class SatPlan(private val kind: Int) {
     private fun fetch(frame: Instant, z: Int, x: Int, y: Int): Any? {
         val src = Sat.sourceFor(z, x)
         if (kind == 1 && src.gibs != null) return EMPTY
-        val t = Sat.timeFor(src, frame) ?: return null
+        val t = if (kind == 1) Sat.overlayTime(frame) else Sat.timeFor(src, frame) ?: return null
         val k = SatMem.key(kind, t, z, x, y)
         val img = SatMem.mem.get(k)
         if (img != null) return img

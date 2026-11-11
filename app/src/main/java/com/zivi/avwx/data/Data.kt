@@ -1071,6 +1071,53 @@ object Sat {
 
     fun isResolved(o: Overlay): Boolean = resolved[o] != null
 
+    private val ovLatest = java.util.concurrent.ConcurrentHashMap<Overlay, Instant>()
+    private val ovCheckedAt = java.util.concurrent.ConcurrentHashMap<Overlay, Long>()
+
+    /** The overlay being shown, so frame times can be matched to it while drawing. */
+    @Volatile var activeOverlay: Overlay = Overlay.NONE
+
+    /** Newest time the overlay product has reached, or null when not known. */
+    fun overlayLatest(o: Overlay): Instant? = ovLatest[o]
+
+    /**
+     * Rain and cloud-top products are worked out after the infrared picture, so they lag behind it.
+     * A frame newer than the product's newest time uses that newest time instead.
+     */
+    fun overlayTime(frame: Instant): Instant {
+        val l = ovLatest[activeOverlay] ?: return frame
+        return if (frame.isAfter(l)) l else frame
+    }
+
+    /** Reads how far an overlay product has got from the server's listing for that layer. Asked at most every 2 minutes. */
+    suspend fun checkOverlayLatest(o: Overlay): Instant? = withContext(Dispatchers.IO) {
+        val layer = resolved[o] ?: return@withContext null
+        val now = System.currentTimeMillis()
+        val last = ovCheckedAt[o]
+        if (last != null && now - last < 2 * 60_000L) return@withContext ovLatest[o]
+        ovCheckedAt[o] = now
+        val parts = layer.split(":")
+        if (parts.size != 2) return@withContext null
+        try {
+            val xml = Net.getText(
+                "https://view.eumetsat.int/geoserver/${parts[0]}/${parts[1]}/wms?service=WMS&version=1.1.1&request=GetCapabilities",
+                maxBytes = 1_500_000,
+            )
+            val limit = Instant.ofEpochMilli(now).plusSeconds(300)
+            val floor = Instant.ofEpochMilli(now).minusSeconds(12 * 3600)
+            var best: Instant? = null
+            for (m in ISO_RE.findAll(xml)) {
+                val t = try { Instant.parse(m.value) } catch (e: Exception) { continue }
+                if (t.isAfter(limit) || t.isBefore(floor)) continue
+                if (best == null || t.isAfter(best)) best = t
+            }
+            if (best != null) ovLatest[o] = Instant.ofEpochSecond(best.epochSecond / (STEP_MIN * 60) * (STEP_MIN * 60))
+        } catch (e: Exception) {
+            // Keep what was known.
+        }
+        ovLatest[o]
+    }
+
     /** An overlay tile (transparent where there is nothing to show) in the server's own colours. */
     suspend fun loadOverlayTile(ctx: Context, o: Overlay, src: SatSource, time: Instant, z: Int, x: Int, y: Int): Bitmap? = withContext(Dispatchers.IO) {
         if (src.gibs != null) return@withContext null
@@ -1090,7 +1137,8 @@ object Sat {
                 }
                 val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: continue
                 if (src.id != 0) westFails[o] = 0
-                f.writeBytes(bytes)
+                // An empty tile may only mean the product isn't out yet, so it isn't kept on the phone.
+                if (!isClear(bmp)) f.writeBytes(bytes)
                 return@withContext bmp
             }
             if (src.id != 0) westFails[o] = (westFails[o] ?: 0) + 1
@@ -1098,6 +1146,21 @@ object Sat {
         } catch (e: Exception) {
             null
         }
+    }
+
+    /** True when the tile is see-through everywhere sampled. */
+    private fun isClear(b: Bitmap): Boolean {
+        val step = (b.width / 16).coerceAtLeast(1)
+        var y = step / 2
+        while (y < b.height) {
+            var x = step / 2
+            while (x < b.width) {
+                if ((b.getPixel(x, y) ushr 24) > 30) return false
+                x += step
+            }
+            y += step
+        }
+        return true
     }
 
     /** True when every sampled pixel is the same (the server had no picture for that time or place). */

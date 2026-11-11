@@ -336,6 +336,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var overlayLegend by mutableStateOf<Bitmap?>(null)
         private set
+    /** Newest time the rain or tops product has reached. */
+    var overlayTo by mutableStateOf<Instant?>(null)
+        private set
     var showSigmet by mutableStateOf(store.showSigmet)
         private set
     var loopHours by mutableStateOf(store.loopHours.coerceIn(1, 3))
@@ -375,6 +378,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (o == overlay) return
         overlay = o
         store.overlay = o.key
+        Sat.activeOverlay = o
+        overlayTo = Sat.overlayLatest(o)
         overlayLegend = null
         overlayMissing = false
         restyle()
@@ -428,8 +433,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (key in inFlight) return null
         val failedAt = SatMem.failed[key]
         val irNeed = SatMem.mem.get(key) == null && (failedAt == null || System.currentTimeMillis() - failedAt > 60_000L)
-        val oKey = SatMem.key(1, t, z, x, y)
-        val ovNeed = src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && oKey !in SatMem.empty
+        val oKey = SatMem.key(1, Sat.overlayTime(frame), z, x, y)
+        val ovNeed = src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && !SatMem.isEmpty(oKey)
         return if (irNeed || ovNeed) key else null
     }
 
@@ -495,9 +500,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val src = Sat.sourceFor(item.z, item.x)
         val t = Sat.timeFor(src, item.frame) ?: return
         val key = SatMem.key(0, t, item.z, item.x, item.y)
-        val oKey = SatMem.key(1, t, item.z, item.x, item.y)
+        val ovT = Sat.overlayTime(item.frame)
+        val oKey = SatMem.key(1, ovT, item.z, item.x, item.y)
         val irNeed = SatMem.mem.get(key) == null
-        val ovNeed = src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && oKey !in SatMem.empty
+        val ovNeed = src.gibs == null && overlayReady() && SatMem.mem.get(oKey) == null && !SatMem.isEmpty(oKey)
         if (!irNeed && !ovNeed) return
 
         if (src.gibs != null) {
@@ -518,21 +524,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             } else if (gen == styleGen) SatMem.failed[key] = System.currentTimeMillis()
         }
         if (ovNeed) {
-            val raw = Sat.loadOverlayTile(ctx, kind, src, t, item.z, item.x, item.y)
+            val raw = Sat.loadOverlayTile(ctx, kind, src, ovT, item.z, item.x, item.y)
             val table = topsTable
             val out: Bitmap? = when {
                 raw == null -> null
                 kind == Overlay.TOPS -> {
-                    if (grey != null && table != null) {
+                    // The mask must come from the infrared picture of the same time as the tops.
+                    val mask = if (ovT == t) grey else Sat.loadIrTile(ctx, src, ovT, item.z, item.x, item.y)
+                    val res = if (mask != null && table != null) {
                         val start = Sat.threshold(sensitivity)
-                        Sat.recolourTops(raw, table, topsFl, grey, start + (255 - start) / 2).also { raw.recycle() }
-                    } else { raw.recycle(); null }
+                        Sat.recolourTops(raw, table, topsFl, mask, start + (255 - start) / 2)
+                    } else null
+                    raw.recycle()
+                    if (mask != null && mask !== grey) mask.recycle()
+                    res
                 }
                 kind == Overlay.RAIN && !showLightRain -> Sat.hideLightRain(raw).also { raw.recycle() }
                 else -> raw
             }
             if (gen == styleGen) {
-                if (out != null) SatMem.mem.put(oKey, out.asImageBitmap()) else SatMem.empty.add(oKey)
+                if (out != null) SatMem.mem.put(oKey, out.asImageBitmap()) else SatMem.empty[oKey] = System.currentTimeMillis()
                 SatMem.tick++
             }
         }
@@ -562,6 +573,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
             // The overlay's layer name and colour key are looked up once.
             val kind = overlay
+            Sat.activeOverlay = kind
             if (kind != Overlay.NONE &&
                 (!Sat.isResolved(kind) || (kind == Overlay.RAIN && overlayLegend == null) || (kind == Overlay.TOPS && topsTable == null))
             ) {
@@ -571,6 +583,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 overlayMissing = !Sat.isResolved(kind)
                 rebuildQueue()
                 pump()
+            }
+            // How far the overlay product has got; frames past that show its newest picture.
+            if (kind != Overlay.NONE && Sat.isResolved(kind)) {
+                val before = Sat.overlayLatest(kind)
+                val now = Sat.checkOverlayLatest(kind)
+                overlayTo = now
+                if (now != before) {
+                    SatMem.tick++
+                    rebuildQueue()
+                    pump()
+                }
             }
 
             // NASA's satellites: find their newest picture, then queue their tiles.
