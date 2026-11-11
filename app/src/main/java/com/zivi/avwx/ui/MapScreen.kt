@@ -189,10 +189,8 @@ fun MapScreen(vm: AppViewModel, now: Long) {
         }
     }
 
-    TileLoader(TileSource.MAP, cam)
+    val baseMap = remember { BaseMapLink() }
 
-    val places = rememberPlaces()
-    val names = remember { PlaceLabels(dark = false) }
     val apBoxes = remember { ArrayList<RectF>() }
     val allAirports = remember(vm.airports) { MvAirports.merged(vm.airports) }
     val irPlan = remember { SatPlan(0) }
@@ -221,6 +219,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
     }
 
     Box(Modifier.fillMaxSize().background(SEA)) {
+        BaseMap(baseMap, Modifier.fillMaxSize())
         Canvas(
             Modifier
                 .fillMaxSize()
@@ -248,7 +247,7 @@ fun MapScreen(vm: AppViewModel, now: Long) {
                 val ox = cam.cx
                 val oy = cam.cy
 
-                drawTiles(TileSource.MAP, cam)
+                baseMap.sync(cam, density)
 
                 // ---- wind speed wash, under the cloud
                 if (wash != null && windGrid != null) drawWindWash(wash, windGrid, cam, 0.62f)
@@ -291,7 +290,6 @@ fun MapScreen(vm: AppViewModel, now: Long) {
 
                 // ---- airports (all Maldivian ones, yours in colour), then English place names around them
                 drawAirports(allAirports, decoded, cam, labelPaint, apBoxes)
-                names.draw(this, places, cam, apBoxes)
 
                 // ---- the point tapped for a forecast read-out
                 val tp = tip
@@ -501,7 +499,7 @@ private fun Timeline(
             KeyBar("Cloud", colours, "low", "coldest tops / deep CB")
         }
         Text(
-            "Map © CARTO, OpenStreetMap · Names: Natural Earth · Satellite © EUMETSAT, NASA GIBS · Forecast: Open-Meteo",
+            "Map © OpenFreeMap, OpenMapTiles, OpenStreetMap · Satellite © EUMETSAT, NASA GIBS · Forecast: Open-Meteo",
             fontSize = 8.sp, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp),
         )
